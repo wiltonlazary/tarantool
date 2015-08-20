@@ -165,7 +165,7 @@ add_subdirectory(box)
 set(TARANTOOL_C_FLAGS ${CMAKE_C_FLAGS} PARENT_SCOPE)
 set(TARANTOOL_CXX_FLAGS ${CMAKE_CXX_FLAGS} PARENT_SCOPE)
 
-add_executable(tarantool main.cc ffisyms.cc)
+add_executable(tarantool main.cc ffisyms.cc tntps.cc)
 add_dependencies(tarantool build_bundled_libs)
 target_link_libraries(tarantool box ${common_libraries})
 

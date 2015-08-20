@@ -66,6 +66,7 @@
 #include <third_party/gopt/gopt.h>
 #include "cfg.h"
 #include <readline/history.h>
+#include "tntps.h"
 
 static pid_t master_pid = getpid();
 char *script = NULL;
@@ -109,7 +110,8 @@ title(const char *role, const char *fmt, ...)
 		bufptr += snprintf(bufptr, bufend - bufptr, "%s", s);
 	}
 
-	set_proc_title(buf);
+	set_proc_title("%s", buf);
+	tntps_on_proc_title_changed(buf);
 }
 
 const char *
@@ -349,45 +351,26 @@ create_pid(void)
 static void
 background()
 {
-	/* flush buffers to avoid multiple output */
-	/* https://github.com/tarantool/tarantool/issues/366 */
-	fflush(stdout);
-	fflush(stderr);
-	switch (fork()) {
-	case -1:
-		goto error;
-	case 0:                                     /* child */
-		break;
-	default:                                    /* parent */
-		exit(EXIT_SUCCESS);
-	}
-
-	if (setsid() == -1)
-		goto error;
-
-	/*
-	 * tell libev we've just forked, this is necessary to re-initialize
-	 * kqueue on FreeBSD.
-	 */
-	ev_loop_fork(cord()->loop);
-
-	/*
-	 * reinit signals after fork, because fork() implicitly calls
-	 * signal_reset() via pthread_atfork() hook installed by signal_init().
-	 */
-	signal_init();
-
-	/* reinit coeio after fork (because libeio required it) */
-	coeio_reinit();
 	/*
 	 * Prints to stdout on failure, so got to be done before
 	 * we close it.
 	 */
 	create_pid();
 
+	/*
+	 * Once we become a new session leader we lose controlling terminal
+	 * and we are no longer allowed to interact with it (hence this
+	 * particular order).
+	 */
+	if (setsid() == -1)
+		goto error;
+
+	tntps_enter_background_mode();
+
 	close(STDIN_FILENO);
 	close(STDOUT_FILENO);
 	close(STDERR_FILENO);
+
 	return;
 error:
 	exit(EXIT_FAILURE);
@@ -630,6 +613,7 @@ main(int argc, char **argv)
 	main_argc = argc;
 	main_argv = argv;
 
+	tntps_init_main_process();
 	fiber_init();
 	/* Init iobuf library with default readahead */
 	iobuf_init();
