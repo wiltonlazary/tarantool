@@ -67,6 +67,7 @@
 #include "cfg.h"
 #include <readline/history.h>
 #include "tntps.h"
+#include "third_party/tarantool_proctitle.h"
 
 static pid_t master_pid = getpid();
 char *script = NULL;
@@ -80,13 +81,6 @@ static ev_signal ev_sigs[4];
 static const int ev_sig_count = sizeof(ev_sigs)/sizeof(*ev_sigs);
 
 extern const void *opt_def;
-
-/* defined in third_party/proctitle.c */
-extern "C" {
-char **init_set_proc_title(int argc, char **argv);
-void free_proc_title(int argc, char **argv);
-void set_proc_title(const char *format, ...);
-} /* extern "C" */
 
 void
 title(const char *role, const char *fmt, ...)

@@ -40,10 +40,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <say.h>
-
-extern "C" {
-void set_proc_title(const char *format, ...);
-} /* extern "C" */
+#include "third_party/tarantool_proctitle.h"
 
 /**
  * See tntps.h for the description of the main and anchor processes.
