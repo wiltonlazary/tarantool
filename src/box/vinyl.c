@@ -5633,31 +5633,20 @@ struct sicache {
 	uint32_t count;
 	uint64_t nsn;
 	struct vy_range *node;
-	struct sicache *next;
-	struct vy_cachepool *pool;
-};
-
-struct vy_cachepool {
-	struct sicache *head;
-	int n;
-	struct runtime *r;
-	pthread_mutex_t mutex;
 };
 
 static inline void
-si_cacheinit(struct sicache *c, struct vy_cachepool *pool)
+si_cachecreate(struct sicache *c)
 {
 	c->path   = NULL;
 	c->branch = NULL;
 	c->count  = 0;
 	c->node   = NULL;
 	c->nsn    = 0;
-	c->next   = NULL;
-	c->pool   = pool;
 }
 
 static inline void
-si_cachefree(struct sicache *c)
+si_cachedestroy(struct sicache *c)
 {
 	struct sicachebranch *next;
 	struct sicachebranch *cb = c->path;
@@ -5668,25 +5657,6 @@ si_cachefree(struct sicache *c)
 		free(cb);
 		cb = next;
 	}
-}
-
-static inline void
-si_cachereset(struct sicache *c)
-{
-	struct sicachebranch *cb = c->path;
-	while (cb) {
-		vy_buf_reset(&cb->buf_a);
-		vy_buf_reset(&cb->buf_b);
-		cb->branch = NULL;
-		cb->ref = NULL;
-		sd_read_close(&cb->i);
-		cb->open = 0;
-		cb = cb->next;
-	}
-	c->branch = NULL;
-	c->node   = NULL;
-	c->nsn    = 0;
-	c->count  = 0;
 }
 
 static inline struct sicachebranch*
@@ -5794,61 +5764,6 @@ si_cachefollow(struct sicache *c, struct vy_run *seek)
 			return cb;
 	}
 	return NULL;
-}
-
-static inline void
-vy_cachepool_init(struct vy_cachepool *p, struct runtime *r)
-{
-	p->head = NULL;
-	p->n    = 0;
-	p->r    = r;
-	tt_pthread_mutex_init(&p->mutex, NULL);
-}
-
-static inline void
-vy_cachepool_free(struct vy_cachepool *p)
-{
-	struct sicache *next;
-	struct sicache *c = p->head;
-	while (c) {
-		next = c->next;
-		si_cachefree(c);
-		free(c);
-		c = next;
-	}
-	tt_pthread_mutex_destroy(&p->mutex);
-}
-
-static inline struct sicache*
-vy_cachepool_pop(struct vy_cachepool *p)
-{
-	tt_pthread_mutex_lock(&p->mutex);
-	struct sicache *c;
-	if (likely(p->n > 0)) {
-		c = p->head;
-		p->head = c->next;
-		p->n--;
-		si_cachereset(c);
-		c->pool = p;
-	} else {
-		c = malloc(sizeof(struct sicache));
-		if (unlikely(c == NULL))
-			return NULL;
-		si_cacheinit(c, p);
-	}
-	tt_pthread_mutex_unlock(&p->mutex);
-	return c;
-}
-
-static inline void
-vy_cachepool_push(struct sicache *c)
-{
-	struct vy_cachepool *p = c->pool;
-	tt_pthread_mutex_lock(&p->mutex);
-	c->next = p->head;
-	p->head = c;
-	p->n++;
-	tt_pthread_mutex_unlock(&p->mutex);
 }
 
 struct siread {
@@ -9388,7 +9303,6 @@ struct vinyl_env {
 	struct vy_sequence       seq;
 	struct vy_conf      conf;
 	struct vy_quota     quota;
-	struct vy_cachepool cachepool;
 	struct tx_manager   xm;
 	struct scheduler          scheduler;
 	struct vy_stat      stat;
@@ -9419,7 +9333,7 @@ struct vinyl_cursor {
 	int read_disk;
 	int read_cache;
 	int read_commited;
-	struct sicache *cache;
+	struct sicache cache;
 };
 
 void
@@ -9469,7 +9383,6 @@ vinyl_env_delete(struct vinyl_env *e)
 			rcret = -1;
 	}
 	tx_managerfree(&e->xm);
-	vy_cachepool_free(&e->cachepool);
 	vy_conf_free(&e->conf);
 	vy_quota_free(&e->quota);
 	vy_stat_free(&e->stat);
@@ -9943,8 +9856,7 @@ vinyl_cursor_delete(struct vinyl_cursor *c)
 	struct vinyl_env *e = c->index->env;
 	if (! c->read_commited)
 		tx_rollback(&c->tx);
-	if (c->cache)
-		vy_cachepool_push(c->cache);
+	si_cachedestroy(&c->cache);
 	if (c->key)
 		vinyl_tuple_unref(c->index, c->key);
 	vinyl_index_unref(c->index);
@@ -9967,7 +9879,7 @@ vinyl_cursor_next(struct vinyl_cursor *c, struct vinyl_tuple **result,
 
 	struct vy_stat_get statget;
 	assert(c->key != NULL);
-	if (vinyl_index_read(index, c->key, c->order, result, tx, c->cache,
+	if (vinyl_index_read(index, c->key, c->order, result, tx, &c->cache,
 			    cache_only, &statget) != 0) {
 		return -1;
 	}
@@ -10019,12 +9931,7 @@ vinyl_cursor_new(struct vinyl_index *index, struct vinyl_tuple *key,
 	c->ops = 0;
 	c->read_disk = 0;
 	c->read_cache = 0;
-	c->cache = vy_cachepool_pop(&e->cachepool);
-	if (unlikely(c->cache == NULL)) {
-		free(c);
-		vy_oom();
-		return NULL;
-	}
+	si_cachecreate(&c->cache);
 	c->read_commited = 0;
 	tx_begin(&e->xm, &c->tx, VINYL_TX_RO);
 
@@ -10202,6 +10109,8 @@ vinyl_index_read(struct vinyl_index *index, struct vinyl_tuple *key,
 		 struct sicache *cache, bool cache_only,
 		 struct vy_stat_get *statget)
 {
+	assert(cache != NULL);
+
 	struct vinyl_env *e = index->env;
 	uint64_t start  = clock_monotonic64();
 
@@ -10228,20 +10137,6 @@ vinyl_index_read(struct vinyl_index *index, struct vinyl_tuple *key,
 		}
 	} else {
 		vy_sequence(e->r.seq, VINYL_TSN_NEXT);
-	}
-
-	/* prepare read cache */
-	int cachegc = 0;
-	if (cache == NULL) {
-		cachegc = 1;
-		cache = vy_cachepool_pop(&e->cachepool);
-		if (unlikely(cache == NULL)) {
-			if (vup != NULL) {
-				vinyl_tuple_unref(index, vup);
-			}
-			vy_oom();
-			return -1;
-		}
 	}
 
 	int64_t vlsn;
@@ -10282,9 +10177,6 @@ vinyl_index_read(struct vinyl_index *index, struct vinyl_tuple *key,
 	if (vup != NULL) {
 		vinyl_tuple_unref(index, vup);
 	}
-	/* free read cache */
-	if (likely(cachegc))
-		vy_cachepool_push(cache);
 	if (rc < 0) {
 		/* error */
 		assert(q.result == NULL);
@@ -10874,11 +10766,14 @@ static inline int
 vinyl_get(struct vinyl_tx *tx, struct vinyl_index *index, struct vinyl_tuple *key,
 	 struct vinyl_tuple **result, bool cache_only)
 {
+	struct sicache cache;
+	si_cachecreate(&cache);
 	struct vy_stat_get statget;
-	if (vinyl_index_read(index, key, VINYL_EQ, result, tx, NULL,
-			    cache_only, &statget) != 0) {
+	int rc = vinyl_index_read(index, key, VINYL_EQ, result, tx, &cache,
+				  cache_only, &statget);
+	si_cachedestroy(&cache);
+	if (rc != 0)
 		return -1;
-	}
 
 	if (*result == NULL)
 		return 0;
@@ -10904,12 +10799,11 @@ vinyl_prepare(struct vinyl_env *e, struct vinyl_tx *tx)
 	/* prepare transaction */
 	assert(tx->state == VINYL_TX_READY);
 
-	struct sicache *cache = vy_cachepool_pop(&e->cachepool);
-	if (unlikely(cache == NULL))
-		return vy_oom();
-	enum tx_state s = tx_prepare(tx, cache, e->status);
+	struct sicache cache;
+	si_cachecreate(&cache);
+	enum tx_state s = tx_prepare(tx, &cache, e->status);
+	si_cachedestroy(&cache);
 
-	vy_cachepool_push(cache);
 	if (s == VINYL_TX_LOCK) {
 		vy_stat_tx_lock(&e->stat);
 		return 2;
@@ -11134,7 +11028,6 @@ vinyl_env_new(void)
 	sr_init(&e->r, &e->quota,
 		&e->conf.zones, &e->seq, &e->stat);
 	tx_managerinit(&e->xm, &e->r);
-	vy_cachepool_init(&e->cachepool, &e->r);
 	sc_init(&e->scheduler, &e->r);
 
 	mempool_create(&e->read_task_pool, cord_slab_cache(),
