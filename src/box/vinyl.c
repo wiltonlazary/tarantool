@@ -65,6 +65,7 @@
 #include <small/rb.h>
 #include <small/mempool.h>
 #include <msgpuck/msgpuck.h>
+#include <coeio_file.h>
 
 #include "trivia/util.h"
 #include "crc32.h"
@@ -1888,14 +1889,14 @@ txv_aborted(struct txv *v)
 }
 
 
-struct PACKED txlogindex {
+struct txlogindex {
 	uint32_t space_id;
 	uint32_t head, tail;
 	uint32_t count;
 	struct vinyl_index *index;
 };
 
-struct PACKED txlogv {
+struct txlogv {
 	struct sv v;
 	uint32_t space_id;
 	uint32_t next;
@@ -1998,7 +1999,7 @@ txlog_replace(struct txlog *l, int n, struct txlogv *v)
 	vy_buf_set(&l->buf, sizeof(struct txlogv), n, (char*)v, sizeof(struct txlogv));
 }
 
-struct PACKED svmergesrc {
+struct svmergesrc {
 	struct vy_iter *i;
 	struct vy_iter src;
 	uint8_t dup;
@@ -2064,7 +2065,7 @@ sv_mergeadd(struct svmerge *m, struct vy_iter *i)
  * by the incoming data sources.
 */
 
-struct PACKED svmergeiter {
+struct svmergeiter {
 	enum vinyl_order order;
 	struct svmerge *merge;
 	struct svmergesrc *src, *end;
@@ -3656,6 +3657,7 @@ struct PACKED sdid {
 };
 
 struct PACKED sdv {
+	/* TODO: reorder: uint64_t, uint32_t, uint32_t, uint8_t */
 	uint32_t offset;
 	uint8_t  flags;
 	uint64_t lsn;
@@ -3681,8 +3683,8 @@ struct sdpage {
 };
 
 static inline void
-sd_pageinit(struct sdpage *p, struct sdpageheader *h) {
-	p->h = h;
+sd_pageinit(struct sdpage *p, char *data) {
+	p->h = (struct sdpageheader *)data;
 }
 
 static inline struct sdv*
@@ -3698,7 +3700,7 @@ sd_pagepointer(struct sdpage *p, struct sdv *v) {
 	         sizeof(struct sdv) * p->h->count) + v->offset;
 }
 
-struct PACKED sdpageiter {
+struct sdpageiter {
 	struct sdpage *page;
 	struct vy_buf *xfbuf;
 	int64_t pos;
@@ -4332,7 +4334,7 @@ struct sdreadarg {
 	struct key_def *key_def;
 };
 
-struct PACKED sdread {
+struct sdread {
 	struct sdreadarg ra;
 	struct vy_page_info *ref;
 	struct sdpage page;
@@ -4396,7 +4398,7 @@ sd_read_page(struct sdread *i, struct vy_page_info *info)
 			return -1;
 		}
 		vy_filter_free(&f);
-		sd_pageinit(&i->page, (struct sdpageheader*)arg->buf->s);
+		sd_pageinit(&i->page, arg->buf->s);
 		return 0;
 	}
 
@@ -4410,7 +4412,7 @@ sd_read_page(struct sdread *i, struct vy_page_info *info)
 		return -1;
 	}
 	vy_buf_advance(arg->buf, info->size);
-	sd_pageinit(&i->page, (struct sdpageheader*)(arg->buf->s));
+	sd_pageinit(&i->page, arg->buf->s);
 	return 0;
 }
 
@@ -4548,7 +4550,7 @@ static struct vy_iterif sd_readif =
 	.next  = sd_read_next
 };
 
-struct PACKED sdrecover {
+struct sdrecover {
 	struct vy_file *file;
 	int corrupt;
 	struct vy_page_index_header *v;
@@ -4759,11 +4761,17 @@ struct vy_index_conf {
 static void vy_index_conf_init(struct vy_index_conf*);
 static void vy_index_conf_free(struct vy_index_conf*);
 
-struct PACKED vy_run {
+struct vy_loaded_page_cache {
+	struct sdpage page;
+	uint32_t refs;
+};
+
+struct vy_run {
 	struct sdid id;
 	struct vy_page_index index;
 	struct vy_run *link;
 	struct vy_run *next;
+	struct vy_loaded_page_cache *cache;
 };
 
 static inline void
@@ -4773,12 +4781,13 @@ vy_run_init(struct vy_run *b)
 	vy_page_index_init(&b->index);
 	b->link = NULL;
 	b->next = NULL;
+	b->cache = NULL;
 }
 
 static inline struct vy_run*
 vy_run_new()
 {
-	struct vy_run *b = (struct vy_run*)malloc(sizeof(struct vy_run));
+	struct vy_run *b = (struct vy_run *)malloc(sizeof(struct vy_run));
 	if (unlikely(b == NULL)) {
 		vy_oom();
 		return NULL;
@@ -4799,6 +4808,109 @@ vy_run_free(struct vy_run *b)
 {
 	vy_page_index_free(&b->index);
 	free(b);
+	if (b->cache != NULL) {
+		free(b->cache);
+		b->cache = NULL;
+	}
+}
+
+static int
+vy_run_load_page(struct vy_run *run, int pos,
+		 struct vy_file *file, struct vy_filterif *compression)
+{
+	if (run->cache == NULL) {
+		run->cache = calloc(run->index.header.count, sizeof(*run->cache));
+		if (run->cache == NULL)
+			return vy_oom();
+	}
+	if (run->cache[pos].refs) {
+		run->cache[pos].refs++;
+		return 0;
+	}
+	struct vy_page_info *page_info = vy_page_index_get_page(&run->index, pos);
+	char *data = malloc(page_info->unpacked_size);
+	if (data == NULL)
+		return vy_oom();
+
+	int rc;
+	if (compression == NULL) {
+		rc = coeio_pread(file->fd, data,
+				 page_info->unpacked_size, page_info->offset);
+		if (rc) {
+			rc = vy_error("index file '%s' read error: %s",
+				      vy_path_of(&file->path),
+				      strerror(errno));
+			goto err;
+		}
+		run->cache[pos].refs++;
+		if (run->cache[pos].refs == 1)
+			sd_pageinit(&run->cache[pos].page, data);
+		else
+			free(data);
+		return 0;
+	}
+
+	char *tmp_buf = malloc(page_info->size);
+	if (tmp_buf == NULL) {
+		free(data);
+		return vy_oom();
+	}
+	rc = coeio_pread(file->fd, tmp_buf,
+			 page_info->size, page_info->offset);
+	if (rc) {
+		rc = vy_error("index file '%s' read error: %s",
+			      vy_path_of(&file->path),
+			      strerror(errno));
+		goto err;
+	}
+
+	*(struct sdpageheader *)data = *(struct sdpageheader *)tmp_buf;
+	/* decompression */
+	struct vy_filter f;
+	rc = vy_filter_init(&f, compression, VINYL_FOUTPUT);
+	if (unlikely(rc == -1)) {
+		rc = vy_error("index file '%s' decompression error",
+			      vy_path_of(&file->path));
+		goto err;
+	}
+	struct vy_buf buf;
+	vy_buf_init(&buf);
+	rc = vy_filter_next(&f, &buf, tmp_buf + sizeof(struct sdpageheader),
+			    page_info->size - sizeof(struct sdpageheader));
+	if (unlikely(rc == -1)) {
+		rc = vy_error("index file '%s' decompression error",
+			      vy_path_of(&file->path));
+		goto err;
+	}
+	assert(vy_buf_size(&buf) == page_info->size - sizeof(struct sdpageheader));
+	memcpy(data + sizeof(struct sdpageheader), buf.s,
+	       page_info->size - sizeof(struct sdpageheader));
+	vy_buf_free(&buf);
+	vy_filter_free(&f);
+
+	run->cache[pos].refs++;
+	if (run->cache[pos].refs == 1)
+		sd_pageinit(&run->cache[pos].page, data);
+	else
+		free(data);
+
+	return 0;
+err:
+	free(tmp_buf);
+	free(data);
+	return rc;
+}
+
+static void
+vy_run_unload_page(struct vy_run *run, int pos)
+{
+	assert(run->cache != NULL);
+	assert(run->cache[pos].refs > 0);
+	run->cache[pos].refs--;
+	if (run->cache[pos].refs == 0) {
+		free(run->cache[pos].page.h);
+		run->cache[pos].page.h = NULL;
+	}
 }
 
 #define SI_NONE       0
@@ -4813,7 +4925,7 @@ vy_run_free(struct vy_run *b)
 #define SI_RDB_UNDEF  256
 #define SI_RDB_REMOVE 512
 
-struct PACKED vy_range {
+struct vy_range {
 	uint32_t   recover;
 	uint16_t   flags;
 	uint64_t   update_time;
@@ -5225,7 +5337,7 @@ si_lru_vlsn(struct vinyl_index *i)
 	return rc;
 }
 
-struct PACKED sicachebranch {
+struct sicachebranch {
 	struct vy_run *branch;
 	struct vy_page_info *ref;
 	struct sdpage page;
@@ -10934,6 +11046,595 @@ vinyl_service_delete(struct vinyl_service *srv)
 {
 	sd_cfree(&srv->sdc);
 	free(srv);
+}
+
+/**
+ * Iterator over vy_run
+ */
+struct vy_run_itr {
+	struct vinyl_index *index;
+	struct vy_run *run;
+	struct vy_file *file;
+	struct vy_filterif *compression;
+
+	enum vinyl_order order;
+	char *key;
+	uint64_t lsn;
+
+	struct vinyl_tuple *cur_tuple;
+	int cur_loaded_page;
+	uint64_t cur_pos;
+	uint64_t cur_tuple_pos;
+
+	bool search_started;
+	bool search_ended;
+	bool read_error;
+};
+
+/**
+ * vy_run_itr API forward declaration
+ * TODO: move to header and remove static keyword
+ */
+
+/**
+ * Open the iterator
+ */
+static void
+vy_run_itr_open(struct vy_run_itr *itr, struct vinyl_index *index,
+		struct vy_run *run, struct vy_file *file,
+		struct vy_filterif *compression, enum vinyl_order order,
+		char *key, uint64_t lsn);
+
+
+/**
+ * Get a tuple from a record, that iterator currently positioned on
+ */
+static struct vinyl_tuple *
+vy_run_itr_get(struct vy_run_itr *itr);
+
+
+/**
+ * Find the next record with different key as current and visible lsn
+ * Return true if sucess and cur_pos points to the next value;
+ * return false on read error or EOF
+ */
+static bool
+vy_run_itr_next_key(struct vy_run_itr *itr);
+
+/**
+ * Find next (lower, older) record with the same key as current
+ * Return true if the record found
+ * Return false if no value found (or EOF) or there is a read error
+ */
+static bool
+vy_run_itr_next_lsn(struct vy_run_itr *itr);
+
+/**
+ * Close an iterator and free all resources
+ * It's better to call right after end of search
+ */
+static void
+vy_run_itr_close(struct vy_run_itr *itr);
+
+
+/* vy_run_itr support functions */
+
+static struct sdpage *
+vy_itr_load_page(struct vy_run_itr *itr, uint32_t page)
+{
+	assert(page < itr->run->index.header.count);
+	if (itr->cur_loaded_page != (int)page) {
+		if (itr->cur_loaded_page >= 0)
+			vy_run_unload_page(itr->run, itr->cur_loaded_page);
+		itr->cur_loaded_page = -1;
+		itr->read_error = true;
+		if (vy_run_load_page(itr->run, page, itr->file,
+				     itr->compression))
+			return NULL; /* read error */
+		itr->read_error = false;
+		itr->cur_loaded_page = page;
+	}
+	return &itr->run->cache[page].page;
+}
+
+static int
+vy_itr_cmp(struct vy_run_itr *itr, char *key1, uint64_t lsn1,
+	   char *key2, uint64_t lsn2, bool *equal_key)
+{
+	int res = vy_tuple_compare(key1, key2, itr->index->key_def);
+	*equal_key = res == 0;
+	return res ? res : lsn1 > lsn2 ? -1 : lsn1 < lsn2;
+}
+
+static uint64_t
+vy_itr_pos_mid(struct vy_run_itr *itr, uint64_t pos1, uint64_t pos2)
+{
+	assert(pos2 > pos1);
+	uint64_t page1 = pos1 >> 32;
+	uint64_t page2 = pos2 >> 32;
+	if (page2 - page1 > 1) {
+		assert((uint32_t)(pos1 | pos2) == 0);
+		return (page1 + (page2 - page1) / 2) << 32;
+	}
+	struct sdpage *page = vy_itr_load_page(itr, page1);
+	if (page == NULL)
+		return pos1;
+	assert(page1 == page2 || (uint32_t)pos2 == 0);
+	uint64_t diff = page1 == page2 ? pos2 - pos1 :
+				 page->h->count - (uint32_t)pos1;
+	return pos1 + diff / 2;
+}
+
+static uint64_t
+vy_itr_pos_mid_next(struct vy_run_itr *itr, uint64_t mid, uint64_t end)
+{
+	if ((end >> 32) - (mid >> 32) > 1 || (((mid | end) & UINT32_MAX) == 0))
+		return mid;
+	assert((int) (mid >> 32) == itr->cur_loaded_page);
+	struct sdpage *page = &itr->run->cache[itr->cur_loaded_page].page;
+	return ((mid + 1) & UINT32_MAX) == page->h->count ? end : mid + 1;
+}
+
+/**
+ * Read key and lsn by given wide position.
+ * Wide position is ((page_no << 32) | pos_in_page)
+ * Return NULL if read error.
+ */
+static char *
+vy_itr_read(struct vy_run_itr *itr, uint64_t pos, uint64_t *lsn)
+{
+	if ((uint32_t) pos == 0) {
+		struct vy_page_info *page_info = vy_page_index_get_page(
+			&itr->run->index, pos >> 32);
+		*lsn = page_info->min_key_lsn;
+		return vy_page_index_min_key(&itr->run->index, page_info);
+	}
+	struct sdpage *page = vy_itr_load_page(itr, pos >> 32);
+	if (page == NULL)
+		return NULL;
+	struct sdv *info = sd_pagev(page, (uint32_t) pos);
+	*lsn = info->lsn;
+	return sd_pagepointer(page, info);
+}
+
+/**
+ * For vy_run_itr private use
+ * Binary search in a run of given key and lsn.
+ * Resulting wide position ((page_no << 32) | pos_in_page)
+ *   is stored it *pos argument
+ * Normally sets the position to first record that >= than given key & lsn,
+ *  (!) but has a special case of order ==  VINYL_GT,
+ *  when position is set to first record that > than given key & lsn.
+ * If that value was not found then position is set to end_pos (invalid pos)
+ * Return true if record has a key is equal to given key (lsn does not matter)
+ * Return false if not equal or order == VINYL_GT or read error
+ * Beware of:
+ * 1)VINYL_GT special case
+ * 2)search with partial key and lsn != UINT64_MAX is meaningless and dangerous
+ * 3)if return false, the position was set to maximal lsn of the next key
+ */
+static bool vy_itr_search(struct vy_run_itr *itr, char *key, uint64_t lsn,
+			  uint64_t *pos)
+{
+	uint64_t beg = 0;
+	uint64_t end = ((uint64_t) itr->run->index.header.count) << 32;
+	bool end_equal_key = false;
+	while (beg != end) {
+		uint64_t mid = vy_itr_pos_mid(itr, beg, end);
+		uint64_t fnd_lsn;
+		char *fnd_key = vy_itr_read(itr, mid, &fnd_lsn);
+		if (fnd_key == NULL)
+			return false;
+		bool eq;
+		int cmp_res = vy_itr_cmp(itr, fnd_key, fnd_lsn, key, lsn, &eq);
+		if (itr->order == VINYL_GT) {
+			cmp_res = cmp_res ? cmp_res : -1;
+			eq = false;
+		}
+		if (cmp_res < 0) {
+			beg = vy_itr_pos_mid_next(itr, mid, end);
+		} else {
+			end = mid;
+			end_equal_key = eq;
+		}
+	}
+	*pos = end;
+	return end_equal_key;
+}
+
+/**
+ *
+ * Return new value on success, end_pos on read error or EOF
+ * Affects: cur_loaded_page, read_error
+ */
+static uint64_t
+vy_run_itr_next_pos(struct vy_run_itr *itr,
+				    enum vinyl_order order)
+{
+	uint64_t pos = itr->cur_pos;
+	uint64_t end_pos = ((uint64_t) itr->run->index.header.count) << 32;
+	assert(pos < end_pos);
+	if (order == VINYL_LE || order == VINYL_LT) {
+		if (pos == 0)
+			return end_pos;
+		pos--;
+		if ((uint32_t) pos == UINT32_MAX) {
+			struct sdpage *page = vy_itr_load_page(itr, pos >> 32);
+			if (page == NULL)
+				return end_pos;
+			pos ^= UINT32_MAX ^ (page->h->count - 1);
+		}
+	} else {
+		struct sdpage *page = vy_itr_load_page(itr, pos >> 32);
+		if (page == NULL)
+			return end_pos;
+		pos++;
+		if ((uint32_t) itr->cur_pos == page->h->count)
+			return (pos | UINT32_MAX) + 1;
+	}
+	return pos;
+}
+
+static int
+vy_run_itr_lock_page(struct vy_run_itr *itr, int page_no)
+{
+	if (itr->cur_loaded_page != page_no)
+		return -1;
+	vy_run_load_page(itr->run, page_no,
+			 itr->file, itr->compression);
+	return page_no;
+}
+
+static void
+vy_run_itr_unlock_page(struct vy_run_itr *itr, int lock)
+{
+	if (lock >= 0)
+		vy_run_unload_page(itr->run, lock);
+}
+
+/**
+ * For vy_run_itr private use
+ * Find next (lower, older) record with the same key as current
+ * Return true if the record found
+ * Return false if no value found (or EOF) or there is a read error
+ * Affects: cur_loaded_page, cur_pos, search_ended, read_error
+ */
+static bool
+vy_run_itr_find_lsn(struct vy_run_itr *itr)
+{
+	uint64_t end_pos = ((uint64_t) itr->run->index.header.count) << 32;
+	assert(itr->cur_pos < end_pos);
+	uint64_t cur_lsn;
+	char *cur_key = vy_itr_read(itr, itr->cur_pos, &cur_lsn);
+	while (cur_lsn > itr->lsn) {
+		itr->cur_pos = vy_run_itr_next_pos(itr, itr->order);
+		if (itr->cur_pos == end_pos) {
+			itr->search_ended = true;
+			return false;
+		}
+		cur_key = vy_itr_read(itr, itr->cur_pos, &cur_lsn);
+	}
+	bool res = true;
+	if (itr->order == VINYL_LE || itr->order == VINYL_LT) {
+		/* lock page, i.e. prevent from unloading from memory of cur_key */
+		int lock_page = vy_run_itr_lock_page(itr, itr->cur_pos >> 32);
+
+		uint64_t prev_pos = vy_run_itr_next_pos(itr, itr->order);
+		while (prev_pos != end_pos) {
+			uint64_t prev_lsn;
+			char *prev_key = vy_itr_read(itr, prev_pos, &prev_lsn);
+			if (prev_key == NULL) {
+				itr->search_ended = true;
+				res = false;
+				break;
+			}
+			struct key_def *key_def = itr->index->key_def;
+			if (prev_lsn > itr->lsn
+			    || vy_tuple_compare(cur_key, prev_key, key_def)
+			       != 0)
+				break;
+			itr->cur_pos = prev_pos;
+			prev_pos = vy_run_itr_next_pos(itr, itr->order);
+		}
+
+		vy_run_itr_unlock_page(itr, lock_page);
+	}
+	return res;
+}
+
+/**
+ * For vy_run_itr private use
+ * Find next (lower, older) record with the same key as current
+ * Return true if the record found
+ * Return false if no value found (or EOF) or there is a read error
+ * Affects: cur_loaded_page, cur_pos, search_ended, read_error
+ */
+static bool
+vy_run_itr_start(struct vy_run_itr *itr)
+{
+	assert(itr->cur_loaded_page == -1);
+	assert(!itr->search_started);
+	itr->search_started = true;
+	uint64_t end_pos = ((uint64_t) itr->run->index.header.count) << 32;
+	bool equal_found = false;
+	if (itr->key != NULL) {
+		equal_found = vy_itr_search(itr, itr->key, UINT64_MAX,
+					    &itr->cur_pos);
+		if (itr->read_error)
+			return false;
+	} else if (itr->order == VINYL_LE || itr->order == VINYL_LT) {
+		itr->cur_pos = end_pos;
+	} else {
+		itr->cur_pos = 0;
+	}
+	if (itr->order == VINYL_EQ && !equal_found) {
+		itr->search_ended = true;
+		return false;
+	}
+	if (itr->order == VINYL_LT)
+		return vy_run_itr_next_key(itr);
+	else
+		return vy_run_itr_find_lsn(itr);
+}
+
+/**
+ * Open the iterator
+ */
+static void
+vy_run_itr_open(struct vy_run_itr *itr, struct vinyl_index *index,
+		struct vy_run *run, struct vy_file *file,
+		struct vy_filterif *compression, enum vinyl_order order,
+		char *key, uint64_t lsn)
+{
+	itr->index = index;
+	itr->run = run;
+	itr->file = file;
+	itr->compression = compression;
+
+	itr->order = order;
+	itr->key = key;
+	itr->lsn = lsn;
+
+	itr->cur_tuple = NULL;
+	itr->cur_loaded_page = -1;
+	itr->cur_pos = ((uint64_t) itr->run->index.header.count) << 32;
+	itr->cur_tuple_pos = UINT64_MAX;
+
+	itr->search_started = false;
+	itr->search_ended = false;
+	itr->read_error = false;
+}
+
+/**
+ * Get a tuple from a record, that iterator currently positioned on
+ */
+static struct vinyl_tuple *
+vy_run_itr_get(struct vy_run_itr *itr)
+{
+	if (itr->search_ended || itr->read_error)
+		return NULL;
+	if (!itr->search_started)
+	if (vy_run_itr_start(itr))
+		return NULL;
+	if (itr->cur_tuple != NULL) {
+		if (itr->cur_tuple_pos == itr->cur_pos)
+			return itr->cur_tuple;
+		vinyl_tuple_unref(itr->index, itr->cur_tuple);
+		itr->cur_tuple = NULL;
+		itr->cur_tuple_pos = UINT64_MAX;
+	}
+
+	struct sdpage *page = vy_itr_load_page(itr, itr->cur_pos >> 32);
+	if (page == NULL)
+		return NULL;
+	struct sdv *info = sd_pagev(page, (uint32_t)itr->cur_pos);
+	char *key = sd_pagepointer(page, info);
+	itr->cur_tuple = vinyl_tuple_from_data(itr->index, key,
+					       key + info->size);
+	if (itr->cur_tuple == NULL) {
+		vy_oom();
+		itr->read_error = true;
+		return NULL;
+	}
+	itr->cur_tuple->flags = info->flags;
+	itr->cur_tuple->lsn = info->lsn;
+	itr->cur_tuple_pos = itr->cur_pos;
+	return itr->cur_tuple;
+}
+
+/**
+ * Find the next record with different key as current and visible lsn
+ * Return true if sucess and cur_pos points to the next value;
+ * return false on read error or EOF
+ */
+static bool
+vy_run_itr_next_key(struct vy_run_itr *itr)
+{
+	if (itr->search_ended || itr->read_error)
+		return false;
+	if (!itr->search_started) if (vy_run_itr_start(itr))
+		return false;
+	uint64_t end_pos = ((uint64_t) itr->run->index.header.count) << 32;
+	assert(itr->cur_pos < end_pos);
+	struct key_def *key_def = itr->index->key_def;
+	if (itr->order == VINYL_LE || itr->order == VINYL_LT) {
+		if (itr->cur_pos == 0) {
+			itr->search_ended = true;
+			return false;
+		}
+		if (itr->cur_pos == end_pos) {
+			/* special case for reverse iterators */
+			uint64_t page_no = itr->run->index.header.count - 1;
+			struct sdpage *page = vy_itr_load_page(itr, page_no);
+			if (page == NULL)
+				return false;
+			itr->cur_pos = (page_no << 32) | (page->h->count - 1);
+			return vy_run_itr_find_lsn(itr);
+		}
+	}
+	assert(itr->cur_pos < end_pos);
+
+	uint64_t cur_lsn;
+	char *cur_key = vy_itr_read(itr, itr->cur_pos, &cur_lsn);
+	if (cur_key == NULL) {
+		itr->search_ended = true;
+		return false;
+	}
+
+	/* lock page, i.e. prevent from unloading from memory of cur_key */
+	int lock_page = vy_run_itr_lock_page(itr, itr->cur_pos >> 32);
+
+	uint64_t next_lsn;
+	char *next_key;
+	do {
+		itr->cur_pos = vy_run_itr_next_pos(itr, itr->order);
+		if (itr->cur_pos == end_pos)
+			break;
+		next_key = vy_itr_read(itr, itr->cur_pos, &next_lsn);
+	} while (vy_tuple_compare(cur_key, next_key, key_def) == 0);
+
+	vy_run_itr_unlock_page(itr, lock_page);
+
+	if (itr->cur_pos == end_pos) {
+		itr->search_ended = true;
+		return false;
+	}
+
+	return vy_run_itr_find_lsn(itr);
+}
+
+/**
+ * Find next (lower, older) record with the same key as current
+ * Return true if the record found
+ * Return false if no value found (or EOF) or there is a read error
+ */
+static bool
+vy_run_itr_next_lsn(struct vy_run_itr *itr)
+{
+	if (itr->search_ended || itr->read_error)
+		return NULL;
+	if (!itr->search_started) if (vy_run_itr_start(itr))
+		return false;
+	uint64_t end_pos = ((uint64_t) itr->run->index.header.count) << 32;
+	assert(itr->cur_pos < end_pos);
+
+	uint64_t next_pos = vy_run_itr_next_pos(itr, VINYL_GE);
+	if (next_pos == end_pos)
+		return false; /* EOF */
+
+	uint64_t cur_lsn;
+	char *cur_key = vy_itr_read(itr, itr->cur_pos, &cur_lsn);
+	if (cur_key == NULL)
+		return false; /* read error */
+
+	uint64_t next_lsn;
+	char *next_key = vy_itr_read(itr, next_pos, &next_lsn);
+	if (next_key == NULL)
+		return false; /* read error */
+
+	struct key_def *key_def = itr->index->key_def;
+	bool res = vy_tuple_compare(cur_key, next_key, key_def) == 0;
+	itr->cur_pos = res ? next_pos : itr->cur_pos;
+	return res;
+}
+
+/**
+ * Close an iterator and free all resources
+ * It's better to call right after end of search
+ */
+static void
+vy_run_itr_close(struct vy_run_itr *itr)
+{
+	if (itr->cur_tuple != NULL) {
+		vinyl_tuple_unref(itr->index, itr->cur_tuple);
+		itr->cur_tuple = NULL;
+		itr->cur_tuple_pos = UINT64_MAX;
+	}
+	assert(itr->cur_loaded_page < (int)itr->run->index.header.count);
+	if (itr->cur_loaded_page >= 0) {
+		vy_run_unload_page(itr->run, itr->cur_loaded_page);
+		itr->cur_loaded_page = -1;
+	}
+}
+
+struct vy_tuple_itr;
+
+typedef struct vinyl_tuple *(*vy_itr_get_f)(struct vy_tuple_itr *virt_itr);
+typedef bool (*vy_itr_next_key_f)(struct vy_tuple_itr *virt_itr);
+typedef bool (*vy_itr_next_lsn_f)(struct vy_tuple_itr *virt_itr);
+typedef bool (*vy_itr_next_read_error_f)(struct vy_tuple_itr *virt_itr);
+typedef void (*vy_itr_next_close_f)(struct vy_tuple_itr *virt_itr);
+
+struct vy_tuple_itr_iface {
+	vy_itr_get_f get;
+	vy_itr_next_key_f next_key;
+	vy_itr_next_lsn_f next_lsn;
+	vy_itr_next_read_error_f read_error;
+	vy_itr_next_close_f close;
+};
+
+struct vy_tuple_itr {
+	struct vy_tuple_itr_iface *iface;
+	char priv[128];
+};
+
+struct vinyl_tuple *
+vy_run_itr_iface_get(struct vy_tuple_itr *virt_itr)
+{
+	assert(virt_itr->iface->get == vy_run_itr_iface_get);
+	struct vy_run_itr *itr = (struct vy_run_itr *)virt_itr->priv;
+	return vy_run_itr_get(itr);
+}
+
+bool
+vy_run_itr_iface_next_key(struct vy_tuple_itr *virt_itr)
+{
+	assert(virt_itr->iface->next_key == vy_run_itr_iface_next_key);
+	struct vy_run_itr *itr = (struct vy_run_itr *)virt_itr->priv;
+	return vy_run_itr_next_key(itr);
+}
+
+bool
+vy_run_itr_iface_next_lsn(struct vy_tuple_itr *virt_itr)
+{
+	assert(virt_itr->iface->next_lsn == vy_run_itr_iface_next_lsn);
+	struct vy_run_itr *itr = (struct vy_run_itr *)virt_itr->priv;
+	return vy_run_itr_next_lsn(itr);
+}
+
+bool
+vy_run_itr_iface_read_error(struct vy_tuple_itr *virt_itr)
+{
+	assert(virt_itr->iface->read_error == vy_run_itr_iface_read_error);
+	struct vy_run_itr *itr = (struct vy_run_itr *)virt_itr->priv;
+	return itr->read_error;
+}
+
+static void
+vy_run_itr_iface_close(struct vy_tuple_itr *virt_itr)
+{
+	assert(virt_itr->iface->close == vy_run_itr_iface_close);
+	struct vy_run_itr *itr = (struct vy_run_itr *)virt_itr->priv;
+	vy_run_itr_close(itr);
+}
+
+/*static */void /* TODO: turn back static! */
+vy_run_itr_iface_open(struct vy_tuple_itr *virt_itr, struct vinyl_index *index,
+		      struct vy_run *run, struct vy_file *file,
+		      struct vy_filterif *compression, enum vinyl_order order,
+		      char *key, uint64_t lsn)
+{
+	assert(sizeof(virt_itr->priv) >= sizeof(struct vy_run_itr));
+	struct vy_run_itr *itr = (struct vy_run_itr *)virt_itr->priv;
+	static struct vy_tuple_itr_iface iface = {
+		.get = vy_run_itr_iface_get,
+		.next_key = vy_run_itr_iface_next_key,
+		.next_lsn = vy_run_itr_iface_next_lsn,
+		.read_error = vy_run_itr_iface_read_error,
+		.close = vy_run_itr_iface_close
+	};
+	virt_itr->iface = &iface;
+	vy_run_itr_open(itr, index, run, file, compression, order, key, lsn);
 }
 
 /* }}} vinyl service */
