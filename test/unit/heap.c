@@ -30,15 +30,31 @@ test_create()
 	header();
 	struct HEAP(node) *test_node = HEAP(alloc)();
 	struct test_type value = {10, 11, 0};
-	isnt(test_node, NULL, "check that alloc is not failed");
+	if (test_node == NULL) {
+		fail("check that alloc is not failed", "test_node == NULL");
+	}
 	HEAP(create)(test_node, value, 0);
-	is(test_node->parent, NULL, "check that parent is null");
-	is(test_node->left, NULL, "check that left is null");
-	is(test_node->right, NULL, "check that right is null");
-	is(test_node->right, NULL, "check that right is null");
-	is(test_node->value.val1, 10, "check that val.val1 is correct");
-	is(test_node->value.val2, 11, "check that val.val2 is correct");
-	is(test_node->value.c, 0, "check that val.c is correct");
+	if (test_node->parent != NULL) {
+		fail("parent is not null", "test_node->parent != NULL");
+ 	}
+	if (test_node->left != NULL) {
+		fail("check that left is null", "test_node->left != NULL");
+ 	}
+	if (test_node->right != NULL) {
+		fail("check that right is null", "test_node->right != NULL");
+ 	}
+	if (test_node->right != NULL) {
+		fail("check that right is null", "test_node->right != NULL");
+ 	}
+	if (test_node->value.val1 != 10) {
+		fail("check that val.val1 is correct", "test_node->value.val1 != 10)");
+ 	}
+	if (test_node->value.val2 != 11) {
+		fail("val.val2 is incorrect", "test_node->value.val2 != 11");
+ 	}
+	if (test_node->value.c != 0) {
+		fail("check that val.c is correct failed", "test_node->value.c != 0");
+	}
 
 	footer();
 }
@@ -58,8 +74,12 @@ test_insert_1_to_3()
 		value.val1 = i;
 		HEAP(create)(test_node, value, 0);
 		root = HEAP(insert)(root, test_node);
-		is(HEAP(get_min)(root)->val1, 0, "check that min.val1 is correct");
-		ok(HEAP(check_invariants)(0, root), "check heap invariants");
+		if (HEAP(get_min)(root)->val1 != 0) {
+			fail("check that min.val1 is incorrect", "HEAP(get_min)(root)->val1 != 0");
+		}
+		if (!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+	 	}
 	}
 	footer();
 }
@@ -79,8 +99,13 @@ test_insert_3_to_1()
 		value.val1 = i;
 		HEAP(create)(test_node, value, 0);
 		root = HEAP(insert)(root, test_node);
-		is(HEAP(get_min)(root)->val1, i, "check that min.val1 is correct");
-		ok(HEAP(check_invariants)(0, root), "check_heap_invariants");
+		if (HEAP(get_min)(root)->val1 != i) {
+			fail("min.val1 is incorrect", "HEAP(get_min)(root)->val1 != i)");
+		}
+
+		if (!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 	footer();
 }
@@ -100,13 +125,17 @@ test_insert_50_to_150_mod_100()
 		value.val1 = i % 100;
 		HEAP(create)(test_node, value, 0);
 		root = HEAP(insert)(root, test_node);
-		if (i < 100) {
-			is(HEAP(get_min)(root)->val1, 50, "check that min.val1 is correct");
+		if (i < 100 && HEAP(get_min)(root)->val1 != 50) {
+			fail("min.val1 is incorrect", "HEAP(get_min)(root)->val1 != 50");
 		}
-		else {
-			is(HEAP(get_min)(root)->val1, 0, "check that min.val1 is correct");
+		if (i >= 100 && HEAP(get_min)(root)->val1 != 0) {
+			fail("min.val1 is incorrect", "HEAP(get_min)(root)->val1 != 0");
 		}
-		ok(HEAP(check_invariants)(0, root), "check_heap_invariants");
+
+
+		if (!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 	footer();
 }
@@ -129,8 +158,16 @@ test_insert_1000_random()
 		ans = (value.val1 < ans ? value.val1 : ans);
 		HEAP(create)(test_node, value, 0);
 		root = HEAP(insert)(root, test_node);
-		is(HEAP(get_min)(root)->val1, ans, "check that min.val1 is correct");
-		is(root->size, i + 2, "check that size is correct");
+		if (HEAP(get_min)(root)->val1 != ans) {
+			fail("min.val1 is incorrect", "HEAP(get_min)(root)->val1 != ans");
+		}
+		if (root->size != i + 2) {
+			fail("check that size is correct failed", "root->size != i + 2");
+		}
+
+		if (!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 	footer();
 }
@@ -150,14 +187,24 @@ test_insert_10_to_1_pop()
 		value.val1 = i;
 		HEAP(create)(test_node, value, 0);
 		root = HEAP(insert)(root, test_node);
-		is(HEAP(get_min)(root)->val1, i, "check that min.val1 is correct");
-		ok(HEAP(check_invariants)(0, root), "check_heap_invariants");
+		if (HEAP(get_min)(root)->val1 != i) {
+			fail("check that min.val1 is correct failed",
+					 "HEAP(get_min)(root)->val1 != i");
+	 	}
+		if (!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 
 	for (uint32_t i = 1; i <= 10; ++i) {
 		root = HEAP(pop)(root);
-		is(HEAP(get_min)(root)->val1, i + 1, "check that min.val1 is correct");
-		ok(HEAP(check_invariants)(0, root), "check_heap_invariants");
+		if (HEAP(get_min)(root)->val1 != i + 1) {
+		 fail("check that min.val1 is correct failed",
+		 			"HEAP(get_min)(root)->val1 != i + 1");
+		}
+		if (!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 	footer();
 }
@@ -200,9 +247,15 @@ test_insert_10000_pop_10000_random() {
 		ans = (value.val1 < ans ? value.val1 : ans);
 		HEAP(create)(test_node, value, 0);
 		root = HEAP(insert)(root, test_node);
-		is(HEAP(get_min)(root)->val1, ans, "check that min.val1 is correct");
-		is(root->size, i + 2, "check that size is correct");
-		ok(HEAP(check_invariants)(0, root), "check_heap_invariants");
+		if (HEAP(get_min)(root)->val1 != ans) {
+			fail("check that min.val1 is correct", "HEAP(get_min)(root)->val1 != ans");
+		}
+		if (HEAP(size)(root) != i + 2) {
+			fail("check that size is correct", "HEAP(size)(root) != i + 2");
+		}
+		if (!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 
 	qsort(keys, TEST_CASE_SIZE + 1, sizeof(uint32_t), uint32_compare);
@@ -210,16 +263,25 @@ test_insert_10000_pop_10000_random() {
 	for (uint32_t i = 0; i < TEST_CASE_SIZE; ++i) {
 		f = f && (keys[i] < keys[i + 1]);
 	}
-	ok(f, "check that keys is sorted");
+	if(!f)  {
+		fail("check that keys is sorted failed", "!f");
+	}
 
 	uint32_t full_size = root->size;
 	for (uint32_t i = 0; i < TEST_CASE_SIZE; ++i) {
 		test_node = root;
 		HEAP(free)(test_node);
 		root = HEAP(pop)(root);
-		is(HEAP(get_min)(root)->val1, keys[i + 1], "check that min.val1 is correct");
-		is(root->size, full_size - 1 - i, "check that size is correct");
-		ok(HEAP(check_invariants)(0, root), "check_heap_invariants");
+		if (HEAP(get_min)(root)->val1 != keys[i + 1]) {
+			fail("check that min.val1 is correct",
+					 "HEAP(get_min)(root)->val1 != keys[i + 1]");
+		}
+		if (HEAP(size)(root) != full_size - 1 - i) {
+			fail("check size failed", "HEAP(size)(root) != full_size - 1 - i");
+		}
+		if(!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 
 	free(keys);
@@ -235,10 +297,14 @@ test_insert_with_null() {
 	struct test_type value = {10, 0, 0};
 	HEAP(create)(root, value, 0);
 	result = HEAP(insert)(root, NULL);
-	is(result, root, "test insert null");
+	if (result != root) {
+		fail("test insert null failed", "result != root");
+ 	}
 
 	result = HEAP(insert)(NULL, root);
-	is(result, root, "test insert into null");
+	if (result != root) {
+		fail("test insert into null failed", "result != root");
+	 }
 
 	footer();
 }
@@ -254,7 +320,6 @@ test_insert_pop_workload() {
 
 	for(int i = 0; i < TEST_CASE_SIZE; ++i) {
 		if (root->size == 1 || rand() % 5) {
-			note("insert value");
 			current_size++;
 			value.val1 = rand();
 			test_node = HEAP(alloc)();
@@ -262,12 +327,15 @@ test_insert_pop_workload() {
 			root = HEAP(insert)(root, test_node);
 		}
 		else {
-			note("pop value");
 			current_size--;
 			root = HEAP(pop)(root);
 		}
-		is(root->size, current_size, "check size");
-		ok(HEAP(check_invariants)(0, root), "check heap invariants");
+		if (HEAP(size)(root) != current_size) {
+			fail("check size failed", "HEAP(size)(root) != current_size");
+		}
+		if(!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 	footer();
 }
@@ -280,7 +348,9 @@ test_pop_last() {
 	HEAP(create)(root, value, 0);
 	test_root = root;
 	test_root = HEAP(pop)(root);
-	is(test_root, NULL, "test delete last node");
+	if (test_root != NULL) {
+		fail("test delete last node failed", "test_root != NULL");
+	}
 	footer();
 }
 
@@ -298,7 +368,6 @@ test_insert_update_workload() {
 	struct HEAP(node) *test_node = NULL, *root = NULL;
 	for(int i = 0; i < TEST_CASE_SIZE; ++i) {
 		if (nodes_it == current_size || HEAP(size)(root) == 0 || rand() % 5) {
-			note("insert value");
 			value.val1 = rand();
 			test_node = HEAP(alloc)();
 			nodes[current_size++] = test_node;
@@ -306,14 +375,17 @@ test_insert_update_workload() {
 			root = HEAP(insert)(root, test_node);
 		}
 		else {
-			note("do update");
 			value.val1 = rand();
 			nodes[nodes_it]->value = value;
 			root = HEAP(update)(nodes[nodes_it]);
 			nodes_it++;
 		}
-		is(root->size, current_size, "check size");
-		ok(HEAP(check_invariants)(0, root), "check heap invariants");
+		if (HEAP(size)(root) != current_size) {
+			fail("check size failed", "HEAP(size)(root) != current_size");
+		}
+		if(!HEAP(check_invariants)(0, root)) {
+			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
+		}
 	}
 }
 
