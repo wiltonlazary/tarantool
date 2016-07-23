@@ -1,0 +1,4 @@
+Test failed: from iterator some value returned twice is used[val] at /Users/s.feldsherov/Tarantool/tarantool/test/unit/heap_iterator.c:81, in function 'test_iterator_small'
+	*** test_iterator_create ***
+	*** test_iterator_create: done ***
+	*** test_iterator_small ***

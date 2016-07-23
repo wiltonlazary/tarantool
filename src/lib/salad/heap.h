@@ -98,7 +98,7 @@
 /**
  * Heap entry structure.
  */
-struct HEAP(node){
+struct HEAP(node) {
  uint64_t size; /*size of subtree*/
  struct HEAP(node) *left;
  struct HEAP(node) *right;
@@ -106,6 +106,15 @@ struct HEAP(node){
  HEAP_CMP_ARG_TYPE arg;
 
  HEAP_DATA_TYPE value;
+};
+
+/**
+ * Heap iterator structure.
+ */
+struct HEAP(iterator) {
+	struct HEAP(node) *current_node;
+	int depth; // current depth in tree
+	uint64_t mask; // mask of left/right choices
 };
 
 
@@ -126,8 +135,8 @@ HEAP(free)(struct HEAP(node) *nd);
  */
 static void
 HEAP(create)(struct HEAP(node) *node,
-						 HEAP_DATA_TYPE value,
-						 HEAP_CMP_ARG_TYPE arg);
+			HEAP_DATA_TYPE value,
+			HEAP_CMP_ARG_TYPE arg);
 
 /**
  * Check that current tree is full binary tree.
@@ -312,7 +321,7 @@ HEAP(get_size_from_children)(struct HEAP(node) *node) {
 	if (node == NULL) {
 		return 0;
 	}
-	uint32_t size = 1;
+	uint64_t size = 1;
 	if (node->left) {
 		size += node->left->size;
 	}
@@ -342,9 +351,8 @@ HEAP(get_root)(struct HEAP(node) *node) {
 inline static bool
 HEAP(is_full)(const struct HEAP(node) *root) {
 	assert(root);
-	uint64_t size = root->size + 1;
 	/*check that size + 1 is 2^n for some n*/
-	return ((size&(-size)) == size);
+	return ((root->size + 1) & root->size) == 0;
 }
 
 /**
@@ -416,7 +424,7 @@ HEAP(swap_parent_and_son)(struct HEAP(node) *parent, struct HEAP(node) *son) {
 	assert(parent);
 	assert(son);
 	struct HEAP(node) *tmp;
-	uint32_t tmp_size;
+	uint64_t tmp_size;
 	tmp_size = parent->size;
 	parent->size = son->size;
 	son->size = tmp_size;
@@ -731,4 +739,61 @@ HEAP(check_invariants)(struct HEAP(node) *parent, struct HEAP(node) *node) {
 	bool check_right = HEAP(check_invariants)(node, node->right);
 
 	return (check_right && check_left);
+}
+
+/**
+ * Heap iterator alloc.
+ */
+inline static struct HEAP(iterator) * HEAP(iterator_alloc)
+() {
+	return (struct HEAP(iterator) *) malloc(sizeof(struct HEAP(iterator)));
+}
+
+/**
+ * Heap iterator free.
+ */
+inline static void HEAP(iterator_free)
+(struct HEAP(iterator) *it) {
+	return free(it);
+}
+
+/**
+ * Heap iterator init.
+ */
+inline static void HEAP(iterator_init)
+(struct HEAP(iterator) *it, struct HEAP(node) *root) {
+	it->current_node = root;
+	it->mask = 0;
+	it->depth = 0;
+}
+
+/**
+ * Heap iterator next.
+ */
+static struct HEAP(node) * HEAP(iterator_next)
+(struct HEAP(iterator) *it) {
+	struct HEAP(node) *cnode = it->current_node;
+	if (cnode && cnode->left) {
+		it->mask = it->mask & (~ (1 << it->depth));
+		it->depth++;
+		it->current_node = cnode->left;
+		return cnode;
+	}
+
+	while (((it->mask & (1 << it->depth)) || it->current_node->right == NULL)
+					&& it->depth) {
+		it->depth--;
+		it->current_node = it->current_node->parent;
+	}
+
+	if (it->depth == 0 && (it->mask & 1 || it->current_node == NULL)) {
+		it->current_node = NULL;
+		return cnode;
+	}
+
+	it->current_node = it->current_node->right;
+	it->mask = it->mask | (1 << it->depth);
+	it->depth++;
+
+	return cnode;
 }
