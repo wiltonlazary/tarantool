@@ -108,7 +108,7 @@ test_iterator_small() {
 static void
 test_iterator_large() {
 	header();
-	uint32_t TEST_CASE_SIZE = 1000;
+	uint32_t const TEST_CASE_SIZE = 1000;
 	struct HEAP(node) *test_node = NULL, *root = NULL;
 	struct test_type value = {0, 0, 0};
 
@@ -131,7 +131,7 @@ test_iterator_large() {
 			fail("null returned from iterator", "test_node == NULL");
 		}
 		uint32_t val = test_node->value.val1;
-		if (val < 0 || val >= TEST_CASE_SIZE) {
+		if (val == 0 || val >= TEST_CASE_SIZE) {
 			fail("from iterator returned incorrect value", "val < 0 || val >= TEST_CASE_SIZE");
 		}
 		if (used_key[val]) {

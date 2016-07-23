@@ -323,7 +323,7 @@ test_insert_10000_pop_10000_random() {
 	}
 
 	free(keys);
-
+	free(root);
 	footer();
 }
 
@@ -378,6 +378,12 @@ test_insert_pop_workload() {
 			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
 		}
 	}
+
+	while (root) {
+		test_node = root;
+		root = HEAP(pop)(root);
+		HEAP(free)(test_node);
+	}
 	footer();
 }
 
@@ -406,7 +412,7 @@ test_insert_update_workload() {
 	struct test_type value = {UINT_MAX, 0, 0};
 	struct HEAP(node) **nodes;
 	nodes = (struct HEAP(node) **)
-					malloc(sizeof(struct HEAP(node) *) * (TEST_CASE_SIZE + 1));
+		malloc(sizeof(struct HEAP(node) *) * (TEST_CASE_SIZE + 1));
 
 	struct HEAP(node) *test_node = NULL, *root = NULL;
 	for(uint32_t i = 0; i < TEST_CASE_SIZE; ++i) {
@@ -430,6 +436,13 @@ test_insert_update_workload() {
 			fail("check heap invariants failed", "!HEAP(check_invariants)(0, root)");
 		}
 	}
+	
+	while (root) {
+		test_node = root;
+		root = HEAP(pop)(root);
+		HEAP(free)(test_node);
+	}
+	free(nodes);
 	footer();
 }
 
@@ -447,6 +460,6 @@ main(int argc, const char** argv)
 	test_insert_10000_pop_10000_random();
 	test_insert_with_null();
 	test_insert_pop_workload();
-	// test_pop_last();
-	// test_insert_update_workload();
+	test_pop_last();
+	test_insert_update_workload();
 }
