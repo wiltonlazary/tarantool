@@ -63,10 +63,29 @@
 #endif
 
 /**
- * Data comparing function. Takes 3 parameters - value1, value2 and
- * optional value that stored in hash table struct.
- * Third parameter may be simply ignored like that:
- * #define HEAP_LESS(a, b, garb) a < b
+ * Data comparing function. Takes 3 parameters - heap, node1, node2,
+ * where heap is pointer onto core structure and node1, node2
+ * are two pointers on nodes in your structure.
+ * For example you have such type:
+ *	 struct my_type {
+ *	 	int value;
+ *	 	struct heap_<HEAP_NAME>_node vnode;
+ *	 };
+ * Then node1 and node2 will be pointers on field vnode of two
+ * my_type instances.
+ * The function below is example of valid comparator by value:
+ *
+ * int test_type_less(const struct heap_<HEAP_NAME>_core *heap,
+ *			const struct heap_<HEAP_NAME>_node *a,
+ *			const struct heap_<HEAP_NAME>_node *b) {
+ *
+ *	const struct my_type *left = (struct my_type *)((char *)a -
+ *					offsetof(struct my_type, vnode));
+ *	const struct my_type *right = (struct my_type *)((char *)b -
+ *					offsetof(struct my_type, vnode));
+ *	return left->value < right->value;
+ * }
+ *
  * HEAP_LESS is less function that is important!
  */
 #ifndef HEAP_LESS
@@ -88,11 +107,13 @@
 #define HEAP(name) CONCAT4(heap, HEAP_NAME, _, name)
 #endif
 
+/* Structures. */
+
 /**
  * Main structure for holding heap.
  */
 struct HEAP(core) {
- struct HEAP(node) *root;
+ struct HEAP(node) *root; /* pointer onto root of the heap */
  HEAP_CMP_ARG_TYPE arg;
 };
 
@@ -116,37 +137,14 @@ struct HEAP(iterator) {
 };
 
 
-/**
- * Allocate node for heap.
- */
-static struct HEAP(node) *
-HEAP(alloc)();
-
-/**
- * Free heap node.
- */
-static void
-HEAP(free)(struct HEAP(node) *nd);
-
-/**
- * Init heap node.
- */
-static void
-HEAP(init_node)(struct HEAP(node) *node);
+/* Extern API that is the most usefull part. */
 
 /**
  * Init heap.
  */
  inline static void
- HEAP(init_core)(struct HEAP(core) *heap,
- 	       HEAP_CMP_ARG_TYPE arg);
-
-
-/**
- * Check that current tree is full binary tree.
- */
-static bool
-HEAP(is_full)(const struct HEAP(node) *root);
+ HEAP(init)(struct HEAP(core) *heap,
+ 	HEAP_CMP_ARG_TYPE arg);
 
 /**
  * Returns size of according to root.
@@ -159,6 +157,72 @@ HEAP(size)(struct HEAP(core) *heap);
  */
 static struct HEAP(node) *
 HEAP(get_root)(struct HEAP(node) *node);
+
+/**
+ * Erase min value.
+ */
+static struct HEAP(node) *
+HEAP(pop)(struct HEAP(core) *heap);
+
+/**
+ * Insert value.
+ */
+static void
+HEAP(insert)(struct HEAP(core) *heap, struct HEAP(node) *nd);
+
+/**
+ * Delete node from heap.
+ */
+static void
+HEAP(delete)(struct HEAP(core) *heap, struct HEAP(node) *value_node);
+
+/**
+ * Heapify tree after update of value under value_node pointer.
+ */
+static void
+HEAP(update)(struct HEAP(core) *heap, struct HEAP(node) *value_node);
+
+/**
+ * Heap iterator init.
+ */
+static void HEAP(iterator_init)
+(struct HEAP(core) *heap, struct HEAP(iterator) *it);
+
+/**
+ * Heap iterator next.
+ */
+static struct HEAP(node) *
+HEAP(iterator_next) (struct HEAP(iterator) *it);
+
+/**
+ * Debug functions. They are usually useless,
+ * but aplicable for testing.
+ */
+
+/**
+ * Debug function. Check heap invariants for pair node, parent.
+ */
+static bool
+HEAP(check_local_invariants) (struct HEAP(core) *heap,
+				struct HEAP(node) *node,
+				struct HEAP(node) *parent);
+
+/*
+ * Debug function. Check heap invariants for all nodes.
+ */
+static bool
+HEAP(check_invariants)(struct HEAP(core) *heap,
+			struct HEAP(node) *node,
+			struct HEAP(node) *parent);
+
+
+/* Routines. Functions below are useless for ordinary user. */
+
+/**
+ * Init heap node.
+ */
+static void
+HEAP(init_node)(struct HEAP(node) *node);
 
 /**
  * Swap two parent and son.
@@ -187,99 +251,47 @@ HEAP(cut_leaf)(struct HEAP(node) *node);
 /**
  * Get first not full, i.e. first node with less that 2 sons.
  */
-struct HEAP(node)*
+static struct HEAP(node)*
 HEAP(get_first_not_full)(struct HEAP(node) *root);
 
+/**
+ * Check that current tree is full binary tree.
+ */
+static bool
+HEAP(is_full)(const struct HEAP(node) *root);
 
 /**
  * Get last node, i.e. the most right in bottom layer.
  */
-struct HEAP(node) *
+static struct HEAP(node) *
 HEAP(get_last)(struct HEAP(node) *root);
 
 /**
  * Sift up current node.
  */
-void
+static void
 HEAP(sift_up)(struct HEAP(core) *heap, struct HEAP(node) *node);
 
 /**
  * Sift down current node.
  */
- void
- HEAP(sift_down)(struct HEAP(core) *heap, struct HEAP(node) *node);
+static void
+HEAP(sift_down)(struct HEAP(core) *heap, struct HEAP(node) *node);
 
 /**
  * Increment size in every node on path to root.
  */
-void
+static void
 HEAP(inc_size)(struct HEAP(node) *node);
 
 /**
  * Decrement size in every node on path to root.
  */
-void
+static void
 HEAP(dec_size)(struct HEAP(node) *node);
 
 
-/**
- * Insert value.
- */
-struct HEAP(node) *
-HEAP(insert)(struct HEAP(core) *heap, struct HEAP(node) *nd);
-
-/**
- * Erase min value.
- */
-static struct HEAP(node) *
-HEAP(pop)(struct HEAP(core) *heap);
-
-/**
- * Delete node from heap.
- */
-struct HEAP(node) *
-HEAP(delete)(struct HEAP(core) *heap, struct HEAP(node) *value_node);
-
-/**
- * Heapify tree after update of value under value_node pointer.
- */
-inline static struct HEAP(node) *
-HEAP(update)(struct HEAP(core) *heap, struct HEAP(node) *value_node);
-
-/**
- * Debug function. Check heap invariants for pair node, parent.
- */
-static bool
-HEAP(check_local_invariants) (struct HEAP(core) *heap,
-				struct HEAP(node) *node,
-				struct HEAP(node) *parent);
-
-/*
- * Debug function. Check heap invariants for all nodes.
- */
-static bool
-HEAP(check_invariants)(struct HEAP(core) *heap,
-			struct HEAP(node) *node,
-			struct HEAP(node) *parent);
-
 /* Function defenitions */
-
-/**
- * Allocate node for heap.
- */
-inline static struct HEAP(node) *
-HEAP(alloc)() {
-	return (struct HEAP(node) *) malloc(sizeof(struct HEAP(node)));
-}
-
-/**
- * Free heap node.
- */
-inline static void
-HEAP(free)(struct HEAP(node) *nd) {
-	free(nd);
-}
-
 
 /**
  * Init heap node.
@@ -296,7 +308,7 @@ HEAP(init_node)(struct HEAP(node) *node) {
  * Init heap.
  */
  inline static void
- HEAP(init_core)(struct HEAP(core) *heap,
+ HEAP(init)(struct HEAP(core) *heap,
 		HEAP_CMP_ARG_TYPE arg) {
 	heap->root = NULL;
  	heap->arg = arg;
@@ -389,7 +401,7 @@ HEAP(push_info_to_parent)(struct HEAP(node) *parent, struct HEAP(node) *son) {
 /**
  * Cut leaf. Node is a pointer to leaf.
  */
-inline void
+inline static void
 HEAP(cut_leaf)(struct HEAP(node) *node) {
 	assert(node);
 	assert(node->left == NULL);
@@ -460,7 +472,7 @@ HEAP(swap_parent_and_son)(struct HEAP(node) *parent, struct HEAP(node) *son) {
 /**
  * Get first not full, i.e. first node with less that 2 sons.
  */
-struct HEAP(node) *
+static struct HEAP(node) *
 HEAP(get_first_not_full)(struct HEAP(node) *root) {
  assert(root);
 
@@ -495,7 +507,7 @@ HEAP(get_first_not_full)(struct HEAP(node) *root) {
 /**
  * Get last node, i.e. the most right in bottom layer.
  */
-struct HEAP(node) *
+static struct HEAP(node) *
 HEAP(get_last)(struct HEAP(node) *root) {
 	assert(root);
 
@@ -531,7 +543,7 @@ HEAP(get_last)(struct HEAP(node) *root) {
 /**
  * Sift up current node.
  */
-void
+static void
 HEAP(sift_up)(struct HEAP(core) *heap, struct HEAP(node) *node) {
 	assert(node);
 	struct HEAP(node) *parent = node->parent;
@@ -544,7 +556,7 @@ HEAP(sift_up)(struct HEAP(core) *heap, struct HEAP(node) *node) {
 /**
  * Sift down current node.
  */
-void
+static void
 HEAP(sift_down)(struct HEAP(core) *heap, struct HEAP(node) *node) {
 	assert(node);
 	struct HEAP(node) *left = node->left;
@@ -576,7 +588,7 @@ HEAP(sift_down)(struct HEAP(core) *heap, struct HEAP(node) *node) {
 /**
  * Increment size in every node on path to root.
  */
-void
+static void
 HEAP(inc_size)(struct HEAP(node) *node) {
 	while (node->parent) {
 		node = node->parent;
@@ -587,7 +599,7 @@ HEAP(inc_size)(struct HEAP(node) *node) {
 /**
  * Decrement size in every node on path to root.
  */
-void
+static void
 HEAP(dec_size)(struct HEAP(node) *node) {
 	while (node->parent) {
 		node = node->parent;
@@ -599,15 +611,17 @@ HEAP(dec_size)(struct HEAP(node) *node) {
 /**
  * Insert value.
  */
-struct HEAP(node) *
+static void
 HEAP(insert)(struct HEAP(core) *heap, struct HEAP(node) *node) {
 	assert(heap);
 	struct HEAP(node) *root = heap->root;
-	if (root == NULL) {
-		return heap->root = node;
-	}
 	if (node == NULL) {
-		return root;
+		return;
+	}
+	HEAP(init_node)(node);
+	if (root == NULL) {
+		/* save new root */
+		heap->root = node;
 	}
 
 	struct HEAP(node) *first_not_full = HEAP(get_first_not_full)(root);
@@ -622,23 +636,25 @@ HEAP(insert)(struct HEAP(core) *heap, struct HEAP(node) *node) {
 
 	HEAP(sift_up)(heap, node); /* heapify */
 
-	/* return new root */
-	return heap->root = HEAP(get_root)(node);
+	/* save new root */
+	heap->root = HEAP(get_root)(node);
 }
 
 /**
- * Erase min value.
+ * Erase min value. Returns delete value.
  */
 inline static struct HEAP(node) *
 HEAP(pop)(struct HEAP(core) *heap) {
 	assert(heap);
-	return HEAP(delete)(heap, heap->root);
+	struct HEAP(node) *res = heap->root;
+	HEAP(delete)(heap, heap->root);
+	return res;
 }
 
 /*
  * Delete node from heap.
  */
-struct HEAP(node) *
+static void
 HEAP(delete)(struct HEAP(core) *heap, struct HEAP(node) *value_node) {
 	assert(heap);
 	struct HEAP(node) *root = heap->root;
@@ -647,7 +663,8 @@ HEAP(delete)(struct HEAP(core) *heap, struct HEAP(node) *value_node) {
 	/* check that we try to delete last node */
 	if (last_node == root) {
 		assert(last_node == value_node);
-		return heap->root = NULL;
+		/* save new root */
+		heap->root = NULL;
 	}
 
 	assert(last_node->left == NULL);
@@ -675,22 +692,22 @@ HEAP(delete)(struct HEAP(core) *heap, struct HEAP(node) *value_node) {
 	/*heapify */
 	HEAP(update)(heap, last_node);
 
-	/* return new root */
-	return heap->root = HEAP(get_root)(last_node);
+	/* save new root */
+	heap->root = HEAP(get_root)(last_node);
 }
 
 /**
  * Heapify tree after update of value under value_node pointer.
  */
-inline static struct HEAP(node) *
+inline static void
 HEAP(update)(struct HEAP(core) *heap, struct HEAP(node) *value_node) {
 	assert(heap);
 	/* heapify */
 	HEAP(sift_down)(heap, value_node);
 	HEAP(sift_up)(heap, value_node);
 
-	/* return new root */
-	return heap->root = HEAP(get_root)(value_node);
+	/* save new root */
+	heap->root = HEAP(get_root)(value_node);
 }
 
 
@@ -747,22 +764,6 @@ HEAP(check_invariants)(struct HEAP(core) *heap,
 	bool check_right = HEAP(check_invariants)(heap, node, node->right);
 
 	return (check_right && check_left);
-}
-
-/**
- * Heap iterator alloc.
- */
-inline static struct HEAP(iterator) * HEAP(iterator_alloc)
-() {
-	return (struct HEAP(iterator) *) malloc(sizeof(struct HEAP(iterator)));
-}
-
-/**
- * Heap iterator free.
- */
-inline static void HEAP(iterator_free)
-(struct HEAP(iterator) *it) {
-	return free(it);
 }
 
 /**

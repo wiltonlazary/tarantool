@@ -53,10 +53,9 @@ test_iterator_create() {
 	header();
 	struct test_type *value, *root_value;
 	struct heap_test_core heap;
-	heap_test_init_core(&heap, 0);
+	heap_test_init(&heap, 0);
 
 	value = (struct test_type *)malloc(sizeof(struct test_type));
-	heap_test_init_node(&value->node);
 	value->val1 = 0;
 	heap_test_insert(&heap, &value->node);
 
@@ -84,11 +83,10 @@ test_iterator_small() {
 	struct test_type *value, *root_value;
 	struct heap_test_node *test_node;
 	struct heap_test_core heap;
-	heap_test_init_core(&heap, 0);
+	heap_test_init(&heap, 0);
 
 	for (uint32_t i = 4; i > 0; --i) {
 		value = (struct test_type *)malloc(sizeof(struct test_type));
-		heap_test_init_node(&value->node);
 		value->val1 = i;
 		heap_test_insert(&heap, &value->node);
 	}
@@ -145,11 +143,10 @@ test_iterator_large() {
 	struct test_type *value, *root_value;
 	struct heap_test_node *test_node;
 	struct heap_test_core heap;
-	heap_test_init_core(&heap, 0);
+	heap_test_init(&heap, 0);
 
 	for (uint32_t i = TEST_CASE_SIZE; i > 0; --i) {
 		value = (struct test_type *)malloc(sizeof(struct test_type));
-		heap_test_init_node(&value->node);
 		value->val1 = i;
 		heap_test_insert(&heap, &value->node);
 	}
