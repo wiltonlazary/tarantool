@@ -1709,11 +1709,6 @@ sv_lsn(struct sv *v) {
 	return v->i->lsn(v);
 }
 
-static inline void
-sv_set_lsn(struct sv *v, int64_t lsn) {
-	v->i->set_lsn(v, lsn);
-}
-
 static inline char*
 sv_pointer(struct sv *v) {
 	return v->i->pointer(v);
@@ -5031,6 +5026,12 @@ struct vinyl_index {
 	/** Member of env->db or scheduler->shutdown. */
 	struct rlist link;
 };
+
+struct key_def *
+vy_index_key_def(struct vinyl_index *index)
+{
+	return index->key_def;
+}
 
 static int
 vy_range_tree_cmp(vy_range_tree_t *rbtree, struct vy_range *a, struct vy_range *b)

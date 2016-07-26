@@ -280,12 +280,6 @@ VinylEngine::keydefCheck(struct space *space, struct key_def *key_def)
 			  space_name(space),
 			  "Vinyl index must be unique");
 	}
-	if (key_def->iid != 0) {
-		tnt_raise(ClientError, ER_MODIFY_INDEX,
-			  key_def->name,
-			  space_name(space),
-			  "Vinyl secondary indexes are not supported");
-	}
 }
 
 void

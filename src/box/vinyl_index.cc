@@ -57,6 +57,16 @@ VinylIndex::VinylIndex(struct key_def *key_def_arg)
 	env = engine->env;
 	int rc;
 	vinyl_workers_start(env);
+
+	char name[128];
+	snprintf(name, sizeof(name), "%d:%d", key_def->space_id, key_def->iid);
+	db = vinyl_index_by_name(env, name);
+	if (db != NULL) {
+		if (key_def_cmp(key_def_arg, vy_index_key_def(db)))
+			diag_raise();
+		db = NULL;
+		goto index_exists;
+	}
 	/* create database */
 	db = vinyl_index_new(env, key_def, space->format);
 	if (db == NULL)
@@ -68,6 +78,7 @@ VinylIndex::VinylIndex(struct key_def *key_def_arg)
 	rc = vinyl_index_open(db);
 	if (rc == -1)
 		diag_raise();
+index_exists:
 	format = space->format;
 	tuple_format_ref(format, 1);
 }
@@ -235,7 +246,8 @@ vinyl_iterator_exact(struct iterator *ptr)
 {
 	struct vinyl_iterator *it = (struct vinyl_iterator *) ptr;
 	ptr->next = vinyl_iterator_last;
-	VinylIndex *index = (VinylIndex *)index_find(it->space, 0);
+	int iid = vy_index_key_def(it->db)->iid;
+	VinylIndex *index = (VinylIndex *)index_find(it->space, iid);
 	return index->findByKey(it->key, it->part_count);
 }
 
