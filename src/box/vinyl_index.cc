@@ -203,10 +203,9 @@ struct vinyl_iterator {
 	/* key and part_count used only for EQ */
 	const char *key;
 	int part_count;
-	struct space *space;
+	const VinylIndex *index;
 	struct key_def *key_def;
 	struct vinyl_env *env;
-	struct vinyl_index *db;
 	struct vinyl_cursor *cursor;
 };
 
@@ -282,8 +281,7 @@ vinyl_iterator_exact(struct iterator *ptr)
 {
 	struct vinyl_iterator *it = (struct vinyl_iterator *) ptr;
 	ptr->next = vinyl_iterator_last;
-	int iid = vy_index_key_def(it->db)->iid;
-	VinylIndex *index = (VinylIndex *)index_find(it->space, iid);
+	const VinylIndex *index = it->index;
 	return index->findByKey(it->key, it->part_count);
 }
 
@@ -309,10 +307,9 @@ VinylIndex::initIterator(struct iterator *ptr,
 	assert(part_count == 0 || key != NULL);
 	struct vinyl_iterator *it = (struct vinyl_iterator *) ptr;
 	assert(it->cursor == NULL);
-	it->space = space_cache_find(key_def->space_id);
+	it->index = this;
 	it->key_def = key_def;
 	it->env = env;
-	it->db  = db; /* refcounted by vinyl_cursor_new() */
 	it->key = key;
 	it->part_count = part_count;
 
