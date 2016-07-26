@@ -215,11 +215,11 @@ VinylEngine::keydefCheck(struct space *space, struct key_def *key_def)
 		          key_def->name,
 		          space_name(space));
 	}
-	if (! key_def->opts.is_unique) {
+	if ((key_def->iid == 0) && (!key_def->opts.is_unique)) {
 		tnt_raise(ClientError, ER_MODIFY_INDEX,
 			  key_def->name,
 			  space_name(space),
-			  "Vinyl index must be unique");
+			  "Vinyl primary index must be unique");
 	}
 }
 

@@ -153,33 +153,64 @@ VinylSpace::executeReplace(struct txn*,
 	return tuple_bless(new_tuple);
 }
 
+static int
+vinyl_delete_tuple_from_indices(struct space *space, box_tuple_t *tuple,
+			       struct vinyl_tx *tx)
+{
+	uint32_t part_count; /* count of index key parts */
+	uint32_t key_size; /* size of key in bytes */
+	VinylIndex *index; /* current index */
+	char *key; /* key from deleting from current index */
+	uint32_t space_id = space->def.id;
+	for (uint32_t iid = 0; iid < space->index_count; ++iid) {
+		index = (VinylIndex *)space->index[iid];
+		key = box_tuple_extract_key(tuple, space_id, iid, &key_size);
+		part_count = mp_decode_array((const char **)&key);
+		if (vinyl_delete(tx, index->db, key, part_count) < 0) {
+			diag_raise();
+			return 1;
+		}
+	}
+	return 0;
+}
+
 struct tuple *
 VinylSpace::executeDelete(struct txn*, struct space *space,
                            struct request *request)
 {
 	int space_id = request->space_id;
 	int index_id = request->index_id;
-	/* find full tuple in index */
+	Index *current_index = index_find(space, index_id);
 	box_tuple_t *full_tuple = NULL;
-	box_index_get(space_id, index_id,
-		request->key, request->key_end, &full_tuple);
-	if (full_tuple == NULL) {
-		diag_raise();
-		return NULL;
-	}
-
 	struct vinyl_tx *tx = (struct vinyl_tx *)(in_txn()->engine_tx);
-	uint32_t part_count; /* count of index key parts */
-	uint32_t key_size; /* size of key in bytes */
-	VinylIndex *index; /* current index */
-	char *key; /* key from deleting from current index */
-	for (uint32_t iid = 0; iid < space->index_count; ++iid) {
-		index = (VinylIndex *)space->index[iid];
-		key = box_tuple_extract_key(full_tuple, space_id, iid, &key_size);
-		part_count = mp_decode_array((const char **)&key);
-		if (vinyl_delete(tx, index->db, key, part_count) < 0) {
+
+	if (current_index->key_def->opts.is_unique) {
+		/* find full tuple in index */
+		box_index_get(space_id, index_id,
+			request->key, request->key_end, &full_tuple);
+		if (full_tuple == NULL) {
 			diag_raise();
 			return NULL;
+		}
+		vinyl_delete_tuple_from_indices(space, full_tuple, tx);
+	} else {
+		box_iterator_t *index_iterator
+			= box_index_iterator(space_id, index_id, ITER_EQ,
+				request->key, request->key_end);
+		if (index_iterator == NULL) {
+			diag_raise();
+			return NULL;
+		}
+		if (box_iterator_next(index_iterator, &full_tuple) < 0) {
+			diag_raise();
+			return NULL;
+		}
+		while (full_tuple != NULL) {
+			vinyl_delete_tuple_from_indices(space, full_tuple, tx);
+			if (box_iterator_next(index_iterator, &full_tuple) < 0) {
+				diag_raise();
+				return NULL;
+			}
 		}
 	}
 	return NULL;

@@ -57,6 +57,42 @@ VinylIndex::VinylIndex(struct key_def *key_def_arg)
 	env = engine->env;
 	int rc;
 
+	/* if index is not unique then add primary key to end of parts */
+	if (!key_def->opts.is_unique) {
+		Index *primary = index_find(space, 0);
+		struct key_def *primary_def = primary->key_def;
+		int new_parts_count = key_def->part_count +
+			primary_def->part_count;
+
+		/* create new key_def with unique part */
+		struct key_def *new_def
+			= key_def_new(key_def->space_id, key_def->iid,
+				key_def->name, key_def->type, &key_def->opts,
+				new_parts_count);
+
+		/* append original parts to new key_def */
+		memcpy(new_def->parts,
+			key_def->parts,
+			key_def->part_count * sizeof(struct key_part));
+		/* 
+		 * Append primary parts to new key_def.
+		 * Do this by key_def_set_part because this function
+		 * sets comparators for key_def
+		*/
+		uint32_t i = 0, offset = key_def->part_count;
+		uint32_t limit = primary_def->part_count;
+		struct key_part *primary_parts = primary_def->parts;
+		for (; i < limit; ++i, ++offset)
+		{
+			key_def_set_part(new_def, offset,
+				primary_parts[i].fieldno,
+				primary_parts[i].type);
+		}
+		/* all parts is set */
+		key_def_delete(key_def);
+		key_def = new_def;
+	}
+
 	char name[128];
 	snprintf(name, sizeof(name), "%d:%d", key_def->space_id, key_def->iid);
 	db = vinyl_index_by_name(env, name);
@@ -138,7 +174,7 @@ VinylIndex::count(enum iterator_type type, const char *key,
 struct tuple *
 VinylIndex::findByKey(const char *key, uint32_t part_count) const
 {
-	assert(key_def->opts.is_unique && part_count == key_def->part_count);
+	assert(part_count == key_def->part_count);
 	/*
 	 * engine_tx might be empty, even if we are in txn context.
 	 * This can happen on a first-read statement.
