@@ -4782,6 +4782,9 @@ struct vinyl_index {
 	uint32_t *key_map; /* field_id -> part_id map */
 	/** Member of env->db or scheduler->shutdown. */
 	struct rlist link;
+	bool checkpoint_in_progress; /* used by scheduler */
+	bool age_in_progress; /* used by scheduler */
+	bool gc_in_progress; /* used by scheduler */
 };
 
 static int
@@ -7516,7 +7519,6 @@ enum {
 struct scdb {
 	uint32_t workers[SC_QMAX];
 	struct vinyl_index *index;
-	uint32_t active;
 };
 
 struct sctask {
@@ -7529,11 +7531,11 @@ struct scheduler {
 	pthread_mutex_t        lock;
 	uint64_t       checkpoint_lsn_last;
 	uint64_t       checkpoint_lsn;
-	bool           checkpoint;
-	uint32_t       age;
+	bool checkpoint_in_progress;
+	bool age_in_progress;
 	uint64_t       age_time;
 	uint64_t       gc_time;
-	uint32_t       gc;
+	bool gc_in_progress;
 	int            rr;
 	int            count;
 	struct scdb         **i;
@@ -7555,75 +7557,6 @@ vy_workers_start(struct vinyl_env *env);
 static void
 vy_workers_stop(struct vinyl_env *env);
 
-static inline void
-sc_start(struct scheduler *s, int task)
-{
-	int i = 0;
-	while (i < s->count) {
-		s->i[i]->active |= task;
-		i++;
-	}
-}
-
-static inline int
-sc_end(struct scheduler *s, struct scdb *db, int task)
-{
-	db->active &= ~task;
-	int complete = 1;
-	int i = 0;
-	while (i < s->count) {
-		if (s->i[i]->active & task)
-			complete = 0;
-		i++;
-	}
-	return complete;
-}
-
-static inline void
-sc_task_checkpoint(struct scheduler *s)
-{
-	uint64_t lsn = vy_sequence(s->env->seq, VINYL_LSN);
-	s->checkpoint_lsn = lsn;
-	s->checkpoint = true;
-	sc_start(s, SI_CHECKPOINT);
-}
-
-static inline void
-sc_task_checkpoint_done(struct scheduler *s)
-{
-	s->checkpoint = false;
-	s->checkpoint_lsn_last = s->checkpoint_lsn;
-	s->checkpoint_lsn = 0;
-}
-
-static inline void
-sc_task_gc(struct scheduler *s)
-{
-	s->gc = 1;
-	sc_start(s, SI_GC);
-}
-
-static inline void
-sc_task_gc_done(struct scheduler *s, uint64_t now)
-{
-	s->gc = 0;
-	s->gc_time = now;
-}
-
-static inline void
-sc_task_age(struct scheduler *s)
-{
-	s->age = 1;
-	sc_start(s, SI_AGE);
-}
-
-static inline void
-sc_task_age_done(struct scheduler *s, uint64_t now)
-{
-	s->age = 0;
-	s->age_time = now;
-}
-
 static int sc_ctl_checkpoint(struct scheduler*);
 static int sc_ctl_shutdown(struct scheduler*, struct vinyl_index*);
 
@@ -7639,10 +7572,10 @@ scheduler_new(struct vinyl_env *env)
 	tt_pthread_mutex_init(&s->lock, NULL);
 	s->checkpoint_lsn           = 0;
 	s->checkpoint_lsn_last      = 0;
-	s->checkpoint               = false;
-	s->age                      = 0;
+	s->checkpoint_in_progress   = false;
+	s->age_in_progress          = false;
 	s->age_time                 = now;
-	s->gc                       = 0;
+	s->gc_in_progress           = false;
 	s->gc_time                  = now;
 	s->i                        = NULL;
 	s->count                    = 0;
@@ -7665,7 +7598,6 @@ static int sc_add(struct scheduler *s, struct vinyl_index *index)
 	if (unlikely(db == NULL))
 		return -1;
 	db->index  = index;
-	db->active = 0;
 	memset(db->workers, 0, sizeof(db->workers));
 
 	tt_pthread_mutex_lock(&s->lock);
@@ -7737,7 +7669,12 @@ free:
 static int sc_ctl_checkpoint(struct scheduler *s)
 {
 	tt_pthread_mutex_lock(&s->lock);
-	sc_task_checkpoint(s);
+	uint64_t lsn = vy_sequence(s->env->seq, VINYL_LSN);
+	s->checkpoint_lsn = lsn;
+	s->checkpoint_in_progress = true;
+	for (int i = 0; i < s->count; i++) {
+		s->i[i]->index->checkpoint_in_progress = true;
+	}
 	tt_pthread_mutex_unlock(&s->lock);
 	return 0;
 }
@@ -7857,7 +7794,7 @@ sc_do_shutdown(struct scheduler *s, struct sctask *task)
 
 static int
 sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
-      struct scdb *db, uint64_t vlsn, uint64_t now)
+      struct scdb *db, uint64_t vlsn)
 {
 	int rc;
 
@@ -7872,7 +7809,7 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 	}
 
 	/* checkpoint */
-	if (s->checkpoint) {
+	if (s->checkpoint_in_progress) {
 		task->plan.plan = SI_CHECKPOINT;
 		task->plan.checkpoint.lsn = s->checkpoint_lsn;
 		rc = sc_plan(s, &task->plan);
@@ -7884,14 +7821,13 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 			task->db = db;
 			return 1;
 		case 0: /* complete */
-			if (sc_end(s, db, SI_CHECKPOINT))
-				sc_task_checkpoint_done(s);
+			db->index->checkpoint_in_progress = false;
 			break;
 		}
 	}
 
 	/* garbage-collection */
-	if (s->gc) {
+	if (s->gc_in_progress) {
 		task->plan.plan = SI_GC;
 		task->plan.gc.lsn = vlsn;
 		task->plan.gc.percent = zone->gc_wm;
@@ -7904,14 +7840,13 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 			task->db = db;
 			return 1;
 		case 0: /* complete */
-			if (sc_end(s, db, SI_GC))
-				sc_task_gc_done(s, now);
+			db->index->gc_in_progress = false;
 			break;
 		}
 	}
 
 	/* index aging */
-	if (s->age) {
+	if (s->age_in_progress) {
 		task->plan.plan = SI_AGE;
 		task->plan.age.ttl = zone->branch_age * 1000000; /* ms */
 		task->plan.age.ttl_wm = zone->branch_age_wm;
@@ -7924,8 +7859,7 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 			task->db = db;
 			return 1;
 		case 0: /* complete */
-			if (sc_end(s, db, SI_AGE))
-				sc_task_age_done(s, now);
+			db->index->age_in_progress = false;
 			break;
 		}
 	}
@@ -7957,42 +7891,6 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 	return 0;
 }
 
-static inline void
-sc_periodic_done(struct scheduler *s, uint64_t now)
-{
-	/* checkpoint */
-	if (unlikely(s->checkpoint))
-		sc_task_checkpoint_done(s);
-	/* gc */
-	if (unlikely(s->gc))
-		sc_task_gc_done(s, now);
-	/* age */
-	if (unlikely(s->age))
-		sc_task_age_done(s, now);
-}
-
-static inline void
-sc_periodic(struct scheduler *s, struct srzone *zone, uint64_t now)
-{
-	if (unlikely(s->count == 0))
-		return;
-	/* checkpoint */
-	if (zone->periodic_checkpoint && !s->checkpoint) {
-		sc_task_checkpoint(s);
-	}
-
-	/* gc */
-	if (s->gc == 0 && zone->gc_prio && zone->gc_period) {
-		if ((now - s->gc_time) >= zone->gc_period_us)
-			sc_task_gc(s);
-	}
-	/* aging */
-	if (s->age == 0 && zone->branch_prio && zone->branch_age_period) {
-		if ((now - s->age_time) >= zone->branch_age_period_us)
-			sc_task_age(s);
-	}
-}
-
 static int
 sc_schedule(struct vinyl_env *env, struct sctask *task, int64_t vlsn)
 {
@@ -8001,25 +7899,82 @@ sc_schedule(struct vinyl_env *env, struct sctask *task, int64_t vlsn)
 	struct srzone *zone = sr_zoneof(env);
 	int rc;
 	tt_pthread_mutex_lock(&sc->lock);
-	/* start periodic tasks */
-	sc_periodic(sc, zone, now);
 	/* index shutdown-drop */
 	rc = sc_do_shutdown(sc, task);
 	if (rc) {
 		tt_pthread_mutex_unlock(&sc->lock);
 		return rc;
 	}
+
+	if (sc->age_in_progress) {
+		/* Stop periodic aging */
+		bool age_in_progress = false;
+		for (int i = 0; i < sc->count; i++) {
+			if (sc->i[i]->index->age_in_progress) {
+				age_in_progress = true;
+				break;
+			}
+		}
+		if (!age_in_progress) {
+			sc->age_in_progress = false;
+			sc->age_time = now;
+		}
+	} else if (zone->branch_prio && zone->branch_age_period &&
+		   (now - sc->age_time) >= zone->branch_age_period_us &&
+		   sc->count > 0) {
+		/* Start periodic aging */
+		sc->age_in_progress = true;
+		for (int i = 0; i < sc->count; i++) {
+			sc->i[i]->index->age_in_progress = true;
+		}
+	}
+
+	if (sc->gc_in_progress) {
+		/* Stop periodic GC */
+		bool gc_in_progress = false;
+		for (int i = 0; i < sc->count; i++) {
+			if (sc->i[i]->index->gc_in_progress) {
+				gc_in_progress = true;
+				break;
+			}
+		}
+		if (!gc_in_progress) {
+			sc->gc_in_progress = false;
+			sc->gc_time = now;
+		}
+	} else if (zone->gc_prio && zone->gc_period &&
+		   ((now - sc->gc_time) >= zone->gc_period_us) &&
+		   sc->count > 0) {
+		/* Start periodic GC */
+		sc->gc_in_progress = true;
+		for (int i = 0; i < sc->count; i++) {
+			sc->i[i]->index->gc_in_progress = true;
+		}
+	}
+
+	if (sc->checkpoint_in_progress) {
+		bool checkpoint_in_progress = false;
+		for (int i = 0; i < sc->count; i++) {
+			if (sc->i[i]->index->checkpoint_in_progress) {
+				checkpoint_in_progress = true;
+				break;
+			}
+		}
+		if (!checkpoint_in_progress) {
+			sc->checkpoint_in_progress = false;
+			sc->checkpoint_lsn_last = sc->checkpoint_lsn;
+			sc->checkpoint_lsn = 0;
+		}
+	}
+
 	/* peek an index */
 	struct scdb *db = sc_peek(sc);
 	if (unlikely(db == NULL)) {
-		/* complete on-going periodic tasks when there
-		 * are no active index maintenance tasks left */
-		sc_periodic_done(sc, now);
 		tt_pthread_mutex_unlock(&sc->lock);
 		return 0;
 	}
 	assert(db != NULL);
-	rc = sc_do(sc, task, zone, db, vlsn, now);
+	rc = sc_do(sc, task, zone, db, vlsn);
 	/* schedule next index */
 	sc_next(sc);
 	tt_pthread_mutex_unlock(&sc->lock);
@@ -8351,7 +8306,7 @@ vy_info_append_scheduler(struct vy_info *info, struct vy_info_node *root)
 
 	struct scheduler *scheduler = env->scheduler;
 	tt_pthread_mutex_lock(&scheduler->lock);
-	vy_info_append_u32(node, "gc_active", scheduler->gc);
+	vy_info_append_u32(node, "gc_active", scheduler->gc_in_progress);
 	tt_pthread_mutex_unlock(&scheduler->lock);
 	return 0;
 }
@@ -9891,7 +9846,7 @@ bool
 vinyl_checkpoint_is_active(struct vinyl_env *env)
 {
 	tt_pthread_mutex_lock(&env->scheduler->lock);
-	bool is_active = env->scheduler->checkpoint;
+	bool is_active = env->scheduler->checkpoint_in_progress;
 	tt_pthread_mutex_unlock(&env->scheduler->lock);
 	return is_active;
 }
