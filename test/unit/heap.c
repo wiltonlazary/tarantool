@@ -394,6 +394,7 @@ test_insert_pop_workload() {
 			current_size++;
 			value = (struct test_type *)
 				malloc(sizeof(struct test_type));
+			value->val1 = rand();
 			heap_test_init_node(&value->node);
 			heap_test_insert(&heap, &value->node);
 		}
