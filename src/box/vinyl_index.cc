@@ -56,7 +56,6 @@ VinylIndex::VinylIndex(struct key_def *key_def_arg)
 		(VinylEngine *)space->handler->engine;
 	env = engine->env;
 	int rc;
-	vinyl_workers_start(env);
 
 	char name[128];
 	snprintf(name, sizeof(name), "%d:%d", key_def->space_id, key_def->iid);
@@ -67,6 +66,7 @@ VinylIndex::VinylIndex(struct key_def *key_def_arg)
 		db = NULL;
 		goto index_exists;
 	}
+
 	/* create database */
 	db = vinyl_index_new(env, key_def, space->format);
 	if (db == NULL)

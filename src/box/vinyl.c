@@ -120,13 +120,25 @@ struct vinyl_env {
 	struct vy_stat      *stat;
 	struct mempool      read_task_pool;
 	struct mempool      cursor_pool;
+	struct cord *worker_pool;
+	int worker_pool_size;
+	volatile int worker_pool_run;
 };
 
 static inline struct srzone *
 sr_zoneof(struct vinyl_env *r);
 
 enum vy_sequence_op {
+	/**
+	 * The latest LSN of the write ahead log known to the
+	 * engine.
+	 */
 	VINYL_LSN,
+	/**
+	 * The oldest LSN used in one of the read views in
+	 * a transaction in the engine.
+	 */
+	VINYL_VIEW_LSN,
 	VINYL_NSN_NEXT,
 };
 
@@ -134,6 +146,11 @@ struct vy_sequence {
 	pthread_mutex_t lock;
 	/** Log sequence number. */
 	uint64_t lsn;
+	/**
+	 * View sequence number: the oldest read view maintained
+	 * by the front end.
+	 */
+	uint64_t vlsn;
 	/** Node sequence number. */
 	uint64_t nsn;
 };
@@ -173,9 +190,14 @@ vy_sequence_do(struct vy_sequence *n, enum vy_sequence_op op)
 {
 	uint64_t v = 0;
 	switch (op) {
-	case VINYL_LSN:       v = n->lsn;
+	case VINYL_LSN:
+		v = n->lsn;
 		break;
-	case VINYL_NSN_NEXT:   v = ++n->nsn;
+	case VINYL_VIEW_LSN:
+		v = n->vlsn;
+		break;
+	case VINYL_NSN_NEXT:
+		v = ++n->nsn;
 		break;
 	}
 	return v;
@@ -190,45 +212,16 @@ vy_sequence(struct vy_sequence *n, enum vy_sequence_op op)
 	return v;
 }
 
-struct vy_path {
-	char path[PATH_MAX];
-};
-
-static inline void
-vy_path_reset(struct vy_path *p)
+static void
+vy_path_init(char *p, char *dir, uint64_t id, char *ext)
 {
-	p->path[0] = 0;
+	snprintf(p, PATH_MAX, "%s/%020"PRIu64"%s", dir, id, ext);
 }
 
-static inline void
-vy_path_format(struct vy_path *p, char *fmt, ...)
+static void
+vy_path_compound(char *p, char *dir, uint64_t a, uint64_t b, char *ext)
 {
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(p->path, sizeof(p->path), fmt, args);
-	va_end(args);
-}
-
-static inline void
-vy_path_init(struct vy_path *p, char *dir, uint64_t id, char *ext)
-{
-	vy_path_format(p, "%s/%020"PRIu64"%s", dir, id, ext);
-}
-
-static inline void
-vy_path_compound(struct vy_path *p, char *dir, uint64_t a, uint64_t b, char *ext)
-{
-	vy_path_format(p, "%s/%020"PRIu64".%020"PRIu64"%s", dir, a, b, ext);
-}
-
-static inline char*
-vy_path_of(struct vy_path *p) {
-	return p->path;
-}
-
-static inline int
-vy_path_is_set(struct vy_path *p) {
-	return p->path[0] != 0;
+	snprintf(p, PATH_MAX, "%s/%020"PRIu64".%020"PRIu64"%s", dir, a, b, ext);
 }
 
 struct vy_iov {
@@ -288,13 +281,13 @@ struct vy_file {
 	int fd;
 	uint64_t size;
 	int creat;
-	struct vy_path path;
+	char path[PATH_MAX];
 };
 
 static inline void
 vy_file_init(struct vy_file *f)
 {
-	vy_path_reset(&f->path);
+	f->path[0] = '\0';
 	f->fd    = -1;
 	f->size  = 0;
 	f->creat = 0;
@@ -307,7 +300,7 @@ vy_file_open_as(struct vy_file *f, char *path, int flags)
 	f->fd = open(path, flags, 0644);
 	if (unlikely(f->fd == -1))
 		return -1;
-	vy_path_format(&f->path, "%s", path);
+	snprintf(f->path, PATH_MAX, "%s", path);
 	f->size = 0;
 	if (f->creat)
 		return 0;
@@ -347,10 +340,10 @@ vy_file_close(struct vy_file *f)
 static inline int
 vy_file_rename(struct vy_file *f, char *path)
 {
-	int rc = rename(vy_path_of(&f->path), path);
+	int rc = rename(f->path, path);
 	if (unlikely(rc == -1))
 		return -1;
-	vy_path_format(&f->path, "%s", path);
+	snprintf(f->path, PATH_MAX, "%s", path);
 	return 0;
 }
 
@@ -1480,7 +1473,6 @@ struct vy_stat {
 	uint64_t tx;
 	uint64_t tx_rlb;
 	uint64_t tx_conflict;
-	uint64_t tx_lock;
 	struct vy_avg    tx_latency;
 	struct vy_avg    tx_stmts;
 	/* cursor */
@@ -1559,14 +1551,6 @@ vy_stat_tx(struct vy_stat *s, uint64_t start, uint32_t count,
 }
 
 static inline void
-vy_stat_tx_lock(struct vy_stat *s)
-{
-	tt_pthread_mutex_lock(&s->lock);
-	s->tx_lock++;
-	tt_pthread_mutex_unlock(&s->lock);
-}
-
-static inline void
 vy_stat_cursor(struct vy_stat *s, uint64_t start, int read_disk, int read_cache, int ops)
 {
 	uint64_t diff = clock_monotonic64() - start;
@@ -1582,9 +1566,7 @@ vy_stat_cursor(struct vy_stat *s, uint64_t start, int read_disk, int read_cache,
 struct srzone {
 	uint32_t enable;
 	char     name[4];
-	uint32_t mode;
 	uint32_t compact_wm;
-	uint32_t compact_mode;
 	uint32_t branch_prio;
 	uint32_t branch_wm;
 	uint32_t branch_age;
@@ -1595,9 +1577,6 @@ struct srzone {
 	uint32_t gc_period;
 	uint64_t gc_period_us;
 	uint32_t gc_wm;
-	uint32_t lru_prio;
-	uint32_t lru_period;
-	uint64_t lru_period_us;
 };
 
 struct srzonemap {
@@ -1646,7 +1625,6 @@ struct sv;
 
 struct svif {
 	uint8_t   (*flags)(struct sv*);
-	void      (*set_lsn)(struct sv*, int64_t);
 	uint64_t  (*lsn)(struct sv*);
 	char     *(*pointer)(struct sv*);
 	uint32_t  (*size)(struct sv*);
@@ -2276,7 +2254,6 @@ sv_readiter_get(struct svreaditer *im)
 
 struct svwriteiter {
 	uint64_t  vlsn;
-	uint64_t  vlsn_lru;
 	uint64_t  limit;
 	uint64_t  size;
 	uint32_t  sizev;
@@ -2362,8 +2339,6 @@ sv_writeiter_next(struct svwriteiter *im)
 	{
 		struct sv *v = sv_mergeiter_get(im->merge);
 		uint64_t lsn = sv_lsn(v);
-		if (lsn < im->vlsn_lru)
-			continue;
 		int flags = sv_flags(v);
 		int dup = sv_isflags(flags, SVDUP) || sv_mergeisdup(im->merge);
 		if (im->size >= im->limit) {
@@ -2425,8 +2400,8 @@ sv_writeiter_next(struct svwriteiter *im)
 static inline int
 sv_writeiter_open(struct svwriteiter *im, struct svmergeiter *merge,
 		  uint64_t limit,
-                  uint32_t sizev, uint64_t vlsn, uint64_t vlsn_lru,
-                  int save_delete, int save_upsert)
+		  uint32_t sizev, uint64_t vlsn, int save_delete,
+		  int save_upsert)
 {
 	im->upsert_tuple = NULL;
 	im->merge       = merge;
@@ -2434,7 +2409,6 @@ sv_writeiter_open(struct svwriteiter *im, struct svmergeiter *merge,
 	im->size        = 0;
 	im->sizev       = sizev;
 	im->vlsn        = vlsn;
-	im->vlsn_lru    = vlsn_lru;
 	im->save_delete = save_delete;
 	im->save_upsert = save_upsert;
 	im->next  = 0;
@@ -2716,13 +2690,6 @@ svref_lsn(struct sv *v)
 	return ref->v->lsn;
 }
 
-static void
-svref_set_lsn(struct sv *v, int64_t lsn)
-{
-	struct svref *ref = (struct svref *)v->v;
-	ref->v->lsn = lsn;
-}
-
 static char*
 svref_pointer(struct sv *v)
 {
@@ -2741,7 +2708,6 @@ static struct svif svref_if =
 {
        .flags     = svref_flags,
        .lsn       = svref_lsn,
-       .set_lsn   = svref_set_lsn,
        .pointer   = svref_pointer,
        .size      = svref_size
 };
@@ -2864,11 +2830,6 @@ svtuple_lsn(struct sv *v) {
 	return sv_to_tuple(v)->lsn;
 }
 
-static void
-svtuple_set_lsn(struct sv *v, int64_t lsn) {
-	sv_to_tuple(v)->lsn = lsn;
-}
-
 static char*
 svtuple_pointer(struct sv *v) {
 	return sv_to_tuple(v)->data;
@@ -2883,20 +2844,27 @@ static struct svif svtuple_if =
 {
 	.flags     = svtuple_flags,
 	.lsn       = svtuple_lsn,
-	.set_lsn   = svtuple_set_lsn,
 	.pointer   = svtuple_pointer,
 	.size      = svtuple_size
 };
 
+/** Transaction state. */
 enum tx_state {
-	VINYL_TX_UNDEF,
+	/** Initial state. */
 	VINYL_TX_READY,
-	VINYL_TX_COMMIT,
+	/**
+	 * A transaction is finished and validated in the engine.
+	 * It may still be rolled back if there is an error
+	 * writing the WAL.
+	 */
 	VINYL_TX_PREPARE,
-	VINYL_TX_ROLLBACK,
-	VINYL_TX_LOCK
+	/** A transaction is committed. */
+	VINYL_TX_COMMIT,
+	/** A transaction is aborted or rolled back. */
+	VINYL_TX_ROLLBACK
 };
 
+/** Transaction type. */
 enum tx_type {
 	VINYL_TX_RO,
 	VINYL_TX_RW
@@ -3014,7 +2982,6 @@ struct vinyl_tx {
 	uint64_t   vlsn;
 	uint64_t   csn;
 	int log_read;
-	struct rlist     deadlock;
 	rb_node(struct vinyl_tx) tree_node;
 	struct tx_manager *manager;
 };
@@ -3039,7 +3006,6 @@ rb_gen_ext_key(, tx_tree_, tx_tree_t, struct vinyl_tx, tree_node,
 		 tx_tree_cmp, const char *, tx_tree_key_cmp);
 
 struct tx_manager {
-	pthread_mutex_t  lock;
 	tx_tree_t tree;
 	uint32_t    count_rd;
 	uint32_t    count_rw;
@@ -3064,14 +3030,11 @@ tx_index_init(struct tx_index *, struct vinyl_index *,
 static int
 tx_index_free(struct tx_index*, struct tx_manager*);
 
-static struct vinyl_tx *
-tx_manager_find(struct tx_manager*, uint64_t);
-
 static void
 tx_begin(struct tx_manager*, struct vinyl_tx*, enum tx_type);
 
 static void
-tx_gc(struct vinyl_tx*);
+tx_delete(struct vinyl_tx*);
 
 static enum tx_state
 tx_rollback(struct vinyl_tx*);
@@ -3081,24 +3044,6 @@ tx_set(struct vinyl_tx*, struct tx_index*, struct vinyl_tuple*);
 
 static int
 tx_get(struct vinyl_tx*, struct tx_index*, struct vinyl_tuple*, struct vinyl_tuple**);
-
-static uint64_t
-tx_manager_min(struct tx_manager*);
-
-static uint64_t
-tx_manager_max(struct tx_manager*);
-
-static uint64_t
-tx_manager_lsn(struct tx_manager*);
-
-
-static int
-tx_deadlock(struct vinyl_tx*);
-
-static inline int
-tx_manager_count(struct tx_manager *m) {
-	return m->count_rd + m->count_rw;
-}
 
 static struct tx_manager *
 tx_manager_new(struct vinyl_env *env)
@@ -3115,7 +3060,6 @@ tx_manager_new(struct vinyl_env *env)
 	m->csn = 0;
 	m->tsn = 0;
 	m->gc  = NULL;
-	tt_pthread_mutex_init(&m->lock, NULL);
 	m->env = env;
 	return m;
 }
@@ -3123,7 +3067,6 @@ tx_manager_new(struct vinyl_env *env)
 static int
 tx_manager_delete(struct tx_manager *m)
 {
-	tt_pthread_mutex_destroy(&m->lock);
 	free(m);
 	return 0;
 }
@@ -3158,48 +3101,15 @@ tx_index_free(struct tx_index *i, struct tx_manager *m)
 static uint64_t
 tx_manager_min(struct tx_manager *m)
 {
-	tt_pthread_mutex_lock(&m->lock);
-	uint64_t min_tsn = 0;
-	if (tx_manager_count(m) > 0) {
-		struct vinyl_tx *min = tx_tree_first(&m->tree);
-		min_tsn = min->tsn;
-	}
-	tt_pthread_mutex_unlock(&m->lock);
-	return min_tsn;
+	struct vinyl_tx *min = tx_tree_first(&m->tree);
+	return min ? min->tsn : 0;
 }
 
 static uint64_t
 tx_manager_max(struct tx_manager *m)
 {
-	tt_pthread_mutex_lock(&m->lock);
-	uint64_t max_tsn = 0;
-	if (tx_manager_count(m) > 0) {
-		struct vinyl_tx *max = tx_tree_last(&m->tree);
-		max_tsn = max->tsn;
-	}
-	tt_pthread_mutex_unlock(&m->lock);
-	return max_tsn;
-}
-
-static uint64_t
-tx_manager_lsn(struct tx_manager *m)
-{
-	tt_pthread_mutex_lock(&m->lock);
-	uint64_t vlsn;
-	if (tx_manager_count(m) > 0) {
-		struct vinyl_tx *min = tx_tree_first(&m->tree);
-		vlsn = min->vlsn;
-	} else {
-		vlsn = vy_sequence(m->env->seq, VINYL_LSN);
-	}
-	tt_pthread_mutex_unlock(&m->lock);
-	return vlsn;
-}
-
-static struct vinyl_tx *
-tx_manager_find(struct tx_manager *m, uint64_t id)
-{
-	return tx_tree_search(&m->tree, (char*)&id);
+	struct vinyl_tx *max = tx_tree_last(&m->tree);
+	return max ? max->tsn : 0;
 }
 
 static inline enum tx_state
@@ -3218,19 +3128,16 @@ tx_begin(struct tx_manager *m, struct vinyl_tx *tx, enum tx_type type)
 	tx->state = VINYL_TX_READY;
 	tx->type = type;
 	tx->log_read = -1;
-	rlist_create(&tx->deadlock);
 
 	tx->csn = m->csn;
 	tx->tsn = ++m->tsn;
 	tx->vlsn = vy_sequence(m->env->seq, VINYL_LSN);
 
-	tt_pthread_mutex_lock(&m->lock);
 	tx_tree_insert(&m->tree, tx);
 	if (type == VINYL_TX_RO)
 		m->count_rd++;
 	else
 		m->count_rw++;
-	tt_pthread_mutex_unlock(&m->lock);
 }
 
 static inline void
@@ -3286,25 +3193,31 @@ tx_manager_gc(struct tx_manager *m)
 }
 
 static void
-tx_gc(struct vinyl_tx *tx)
+tx_delete(struct vinyl_tx *tx)
 {
 	struct tx_manager *m = tx->manager;
-	tx_promote(tx, VINYL_TX_UNDEF);
 	txlog_free(&tx->log);
 	tx_manager_gc(m);
+	free(tx);
 }
 
 static inline void
 tx_end(struct vinyl_tx *tx)
 {
 	struct tx_manager *m = tx->manager;
-	tt_pthread_mutex_lock(&m->lock);
+	bool was_oldest = tx == tx_tree_first(&m->tree);
 	tx_tree_remove(&m->tree, tx);
 	if (tx->type == VINYL_TX_RO)
 		m->count_rd--;
 	else
 		m->count_rw--;
-	tt_pthread_mutex_unlock(&m->lock);
+	if (was_oldest) {
+		struct vinyl_tx *oldest = tx_tree_first(&m->tree);
+		vy_sequence_lock(m->env->seq);
+		m->env->seq->vlsn = oldest ? oldest->vlsn :
+			m->env->seq->lsn;
+		vy_sequence_unlock(m->env->seq);
+	}
 }
 
 static inline void
@@ -3334,14 +3247,9 @@ tx_rollback(struct vinyl_tx *tx)
 	return VINYL_TX_ROLLBACK;
 }
 
-static inline int
-vy_txprepare_cb(struct vinyl_tx *tx, struct txv *v, uint64_t lsn,
-	    struct sicache *cache, enum vinyl_status status);
-
 static enum tx_state
-tx_prepare(struct vinyl_tx *tx, struct sicache *cache, enum vinyl_status status)
+tx_prepare(struct vinyl_tx *tx)
 {
-	uint64_t lsn = vy_sequence(tx->manager->env->seq, VINYL_LSN);
 	/* proceed read-only transactions */
 	if (tx->type == VINYL_TX_RO || txlog_write_count(&tx->log) == 0)
 		return tx_promote(tx, VINYL_TX_PREPARE);
@@ -3355,23 +3263,14 @@ tx_prepare(struct vinyl_tx *tx, struct sicache *cache, enum vinyl_status status)
 		if (txv_aborted(v))
 			return tx_promote(tx, VINYL_TX_ROLLBACK);
 		struct txv *prev = txv_prev(v);
-		if (prev == NULL) {
-			if (vy_txprepare_cb(tx, v, lsn, cache, status))
-				return tx_promote(tx, VINYL_TX_ROLLBACK);
+		if (prev == NULL)
 			continue;
-		}
-		if (txv_committed(prev)) {
-			if (prev->csn > tx->csn)
-				return tx_promote(tx, VINYL_TX_ROLLBACK);
+		if (txv_committed(prev))
 			continue;
-		}
 		/* force commit for read-only conflicts */
-		if (prev->tuple->flags & SVGET) {
-			if (vy_txprepare_cb(tx, v, lsn, cache, status))
-				return tx_promote(tx, VINYL_TX_ROLLBACK);
+		if (prev->tuple->flags & SVGET)
 			continue;
-		}
-		return tx_promote(tx, VINYL_TX_LOCK);
+		return tx_promote(tx, VINYL_TX_ROLLBACK);
 	}
 	return tx_promote(tx, VINYL_TX_PREPARE);
 }
@@ -3456,71 +3355,6 @@ add:
 	int rc = tx_set(tx, index, key);
 	if (unlikely(rc == -1))
 		return -1;
-	return 0;
-}
-
-static inline int
-tx_deadlock_in(struct tx_manager *m, struct rlist *mark, struct vinyl_tx *t,
-	       struct vinyl_tx *p)
-{
-	if (p->deadlock.next != &p->deadlock)
-		return 0;
-	rlist_add(mark, &p->deadlock);
-	struct vy_bufiter i;
-	vy_bufiter_open(&i, &p->log.buf, sizeof(struct txv *));
-	for (; vy_bufiter_has(&i); vy_bufiter_next(&i))
-	{
-		struct txv *v = * (struct txv **) vy_bufiter_get(&i);
-		if (txv_prev(v) == NULL)
-			continue;
-		do {
-			struct vinyl_tx *n = tx_manager_find(m, v->tsn);
-			assert(n != NULL);
-			if (unlikely(n == t))
-				return 1;
-			int rc = tx_deadlock_in(m, mark, t, n);
-			if (unlikely(rc == 1))
-				return 1;
-			v = txv_prev(v);
-		} while (v);
-	}
-	return 0;
-}
-
-static inline void
-tx_deadlock_unmark(struct rlist *mark)
-{
-	struct vinyl_tx *t, *n;
-	rlist_foreach_entry_safe(t, mark, deadlock, n) {
-		rlist_create(&t->deadlock);
-	}
-}
-
-static int __attribute__((unused)) tx_deadlock(struct vinyl_tx *t)
-{
-	struct tx_manager *m = t->manager;
-	struct rlist mark;
-	rlist_create(&mark);
-	struct vy_bufiter i;
-	vy_bufiter_open(&i, &t->log.buf, sizeof(struct txv *));
-	while (vy_bufiter_has(&i))
-	{
-		struct txv *v = *(struct txv **) vy_bufiter_get(&i);
-		struct txv *prev = txv_prev(v);
-		if (prev == NULL) {
-			vy_bufiter_next(&i);
-			continue;
-		}
-		struct vinyl_tx *p = tx_manager_find(m, prev->tsn);
-		assert(p != NULL);
-		int rc = tx_deadlock_in(m, &mark, t, p);
-		if (unlikely(rc)) {
-			tx_deadlock_unmark(&mark);
-			return 1;
-		}
-		vy_bufiter_next(&i);
-	}
-	tx_deadlock_unmark(&mark);
 	return 0;
 }
 
@@ -4176,7 +4010,6 @@ struct sdmergeconf {
 	uint32_t    compression;
 	struct vy_filterif *compression_if;
 	uint64_t    vlsn;
-	uint64_t    vlsn_lru;
 	uint32_t    save_delete;
 	uint32_t    save_upsert;
 };
@@ -4244,7 +4077,7 @@ sd_read_page(struct sdread *i, struct vy_page_info *info)
 				   arg->buf_read->s, info->size);
 		if (unlikely(rc == -1)) {
 			vy_error("index file '%s' read error: %s",
-				 vy_path_of(&arg->file->path),
+				 arg->file->path,
 				 strerror(errno));
 			return -1;
 		}
@@ -4260,7 +4093,7 @@ sd_read_page(struct sdread *i, struct vy_page_info *info)
 		rc = vy_filter_init(&f, arg->compression_if, VINYL_FOUTPUT);
 		if (unlikely(rc == -1)) {
 			vy_error("index file '%s' decompression error",
-			         vy_path_of(&arg->file->path));
+			         arg->file->path);
 			return -1;
 		}
 		int size = info->size - sizeof(struct sdpageheader);
@@ -4269,7 +4102,7 @@ sd_read_page(struct sdread *i, struct vy_page_info *info)
 				    size);
 		if (unlikely(rc == -1)) {
 			vy_error("index file '%s' decompression error",
-			         vy_path_of(&arg->file->path));
+			         arg->file->path);
 			return -1;
 		}
 		vy_filter_free(&f);
@@ -4282,7 +4115,7 @@ sd_read_page(struct sdread *i, struct vy_page_info *info)
 	rc = vy_file_pread(arg->file, info->offset, arg->buf->s, info->size);
 	if (unlikely(rc == -1)) {
 		vy_error("index file '%s' read error: %s",
-		         vy_path_of(&arg->file->path),
+		         arg->file->path,
 		         strerror(errno));
 		return -1;
 	}
@@ -4453,7 +4286,7 @@ sd_recover_next_of(struct sdrecover *i, struct sdseal *next)
 	/* validate seal pointer */
 	if (unlikely(((pointer + sizeof(struct sdseal)) > eof))) {
 		vy_error("corrupted index file '%s': bad seal size",
-		               vy_path_of(&i->file->path));
+		               i->file->path);
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
@@ -4463,7 +4296,7 @@ sd_recover_next_of(struct sdrecover *i, struct sdseal *next)
 	/* validate index pointer */
 	if (unlikely(((pointer + sizeof(struct vy_page_index_header)) > eof))) {
 		vy_error("corrupted index file '%s': bad index size",
-		               vy_path_of(&i->file->path));
+		               i->file->path);
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
@@ -4474,7 +4307,7 @@ sd_recover_next_of(struct sdrecover *i, struct sdseal *next)
 	uint32_t crc = vy_crcs(index, sizeof(struct vy_page_index_header), 0);
 	if (index->crc != crc) {
 		vy_error("corrupted index file '%s': bad index crc",
-		               vy_path_of(&i->file->path));
+		               i->file->path);
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
@@ -4485,7 +4318,7 @@ sd_recover_next_of(struct sdrecover *i, struct sdseal *next)
 		    + index->size + index->extension;
 	if (unlikely(end > eof)) {
 		vy_error("corrupted index file '%s': bad index size",
-		               vy_path_of(&i->file->path));
+		               i->file->path);
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
@@ -4495,7 +4328,7 @@ sd_recover_next_of(struct sdrecover *i, struct sdseal *next)
 	int rc = sd_sealvalidate(next, index);
 	if (unlikely(rc == -1)) {
 		vy_error("corrupted index file '%s': bad seal",
-		               vy_path_of(&i->file->path));
+		               i->file->path);
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
@@ -4515,14 +4348,14 @@ sd_recover_open(struct sdrecover *ri, struct vinyl_env *env,
 	ri->file = file;
 	if (unlikely(ri->file->size < (sizeof(struct sdseal) + sizeof(struct vy_page_index_header)))) {
 		vy_error("corrupted index file '%s': bad size",
-		               vy_path_of(&ri->file->path));
+		               ri->file->path);
 		ri->corrupt = 1;
 		return -1;
 	}
 	int rc = vy_mmap_map(&ri->map, ri->file->fd, ri->file->size, 1);
 	if (unlikely(rc == -1)) {
 		vy_error("failed to mmap index file '%s': %s",
-		               vy_path_of(&ri->file->path),
+		               ri->file->path,
 		               strerror(errno));
 		return -1;
 	}
@@ -4612,7 +4445,6 @@ static struct svif sdv_if =
 {
 	.flags     = sdv_flags,
 	.lsn       = sdv_lsn,
-	.set_lsn    = NULL,
 	.pointer   = sdv_pointer,
 	.size      = sdv_size
 };
@@ -4625,9 +4457,6 @@ struct vy_index_conf {
 	uint32_t    compression;
 	char       *compression_sz;
 	struct vy_filterif *compression_if;
-	uint32_t    temperature;
-	uint64_t    lru;
-	uint32_t    lru_step;
 	uint32_t    buf_gc_wm;
 	struct srversion   version;
 	struct srversion   version_storage;
@@ -4695,7 +4524,6 @@ struct PACKED vy_range {
 	uint16_t   flags;
 	uint64_t   update_time;
 	uint32_t   used; /* sum of i0->used + i1->used */
-	uint64_t   lru;
 	uint64_t   ac;
 	struct vy_run   self;
 	struct vy_run  *branch;
@@ -4709,19 +4537,17 @@ struct PACKED vy_range {
 	rb_node(struct vy_range) tree_node;
 	struct ssrqnode   nodecompact;
 	struct ssrqnode   nodebranch;
-	struct ssrqnode   nodetemp;
 	struct rlist     gc;
 	struct rlist     commit;
 };
 
 static struct vy_range *vy_range_new(struct key_def *key_def);
 static int
-vy_range_open(struct vy_range*, struct vinyl_env*, struct vy_path*);
+vy_range_open(struct vy_range*, struct vinyl_env*, char *);
 static int
 vy_range_create(struct vy_range*, struct vy_index_conf*, struct sdid*);
 static int vy_range_free(struct vy_range*, struct vinyl_env*, int);
 static int vy_range_gc_index(struct vinyl_env*, struct svindex*);
-static int vy_range_gc(struct vy_range*, struct vy_index_conf*);
 static int vy_range_seal(struct vy_range*, struct vy_index_conf*);
 static int vy_range_complete(struct vy_range*, struct vy_index_conf*);
 
@@ -4740,33 +4566,6 @@ vy_range_unlock(struct vy_range *node) {
 static inline void
 vy_range_split(struct vy_range *node) {
 	node->flags |= SI_SPLIT;
-}
-
-static inline void
-vy_range_ref(struct vy_range *node)
-{
-	tt_pthread_mutex_lock(&node->reflock);
-	node->refs++;
-	tt_pthread_mutex_unlock(&node->reflock);
-}
-
-static inline uint16_t
-vy_range_unref(struct vy_range *node)
-{
-	tt_pthread_mutex_lock(&node->reflock);
-	assert(node->refs > 0);
-	uint16_t v = node->refs--;
-	tt_pthread_mutex_unlock(&node->reflock);
-	return v;
-}
-
-static inline uint16_t
-vy_range_refof(struct vy_range *node)
-{
-	tt_pthread_mutex_lock(&node->reflock);
-	uint16_t v = node->refs;
-	tt_pthread_mutex_unlock(&node->reflock);
-	return v;
 }
 
 static inline struct svindex*
@@ -4847,34 +4646,6 @@ vy_range_size(struct vy_range *n)
 	return size;
 }
 
-struct vy_rangeview {
-	struct vy_range   *node;
-	uint16_t  flags;
-	uint32_t  branch_count;
-};
-
-static inline void
-vy_range_view_init(struct vy_rangeview *v, struct vy_range *node)
-{
-	v->node         = node;
-	v->branch_count = node->branch_count;
-	v->flags        = node->flags;
-}
-
-static inline void
-vy_range_view_open(struct vy_rangeview *v, struct vy_range *node)
-{
-	vy_range_ref(node);
-	vy_range_view_init(v, node);
-}
-
-static inline void
-vy_range_view_close(struct vy_rangeview *v)
-{
-	vy_range_unref(v->node);
-	v->node = NULL;
-}
-
 struct vy_planner {
 	struct ssrq branch;
 	struct ssrq compact;
@@ -4886,13 +4657,10 @@ struct vy_planner {
 #define SI_BRANCH        1
 #define SI_AGE           2
 #define SI_COMPACT       4
-#define SI_COMPACT_INDEX 8
 #define SI_CHECKPOINT    16
 #define SI_GC            32
-#define SI_TEMP          64
 #define SI_SHUTDOWN      512
 #define SI_DROP          1024
-#define SI_LRU           8192
 #define SI_NODEGC        16384
 
 /* explain */
@@ -4905,31 +4673,26 @@ struct vy_planner {
 struct vy_plan {
 	int explain;
 	int plan;
-	/* branch:
-	 *   a: index_size
-	 * age:
-	 *   a: ttl
-	 *   b: ttl_wm
-	 * compact:
-	 *   a: branches
-	 *   b: mode
-	 * compact_index:
-	 *   a: index_size
-	 * checkpoint:
-	 *   a: lsn
-	 * nodegc:
-	 * gc:
-	 *   a: lsn
-	 *   b: percent
-	 * lru:
-	 * temperature:
-	 * snapshot:
-	 *   a: ssn
-	 * shutdown:
-	 * drop:
-	 */
-	uint64_t a, b, c;
 	struct vy_range *node;
+	union {
+		struct {
+			uint32_t index_size;
+		} branch;
+		struct {
+			uint32_t ttl;
+			uint32_t ttl_wm;
+		} age;
+		struct {
+			uint32_t branches;
+		} compact;
+		struct {
+			uint64_t lsn;
+			uint32_t percent;
+		} gc;
+		struct {
+			uint64_t lsn;
+		} checkpoint;
+	};
 };
 
 static int vy_plan_init(struct vy_plan*);
@@ -4987,8 +4750,6 @@ struct vy_profiler {
 	int       histogram_branch_20plus;
 	char      histogram_branch_sz[256];
 	char     *histogram_branch_ptr;
-	char      histogram_temperature_sz[256];
-	char     *histogram_temperature_ptr;
 	struct vinyl_index  *i;
 };
 
@@ -5005,11 +4766,6 @@ struct vinyl_index {
 	struct vy_planner p;
 	int range_count;
 	uint64_t update_time;
-	uint64_t lru_run_lsn;
-	uint64_t lru_v;
-	uint64_t lru_steps;
-	uint64_t lru_intr_lsn;
-	uint64_t lru_intr_sum;
 	uint64_t read_disk;
 	uint64_t read_cache;
 	uint64_t size;
@@ -5066,48 +4822,7 @@ vinyl_index_delete(struct vinyl_index *index);
 static struct vy_range *si_bootstrap(struct vinyl_index*, uint64_t);
 static int vy_plan(struct vinyl_index*, struct vy_plan*);
 static int
-si_execute(struct vinyl_index*, struct sdc*, struct vy_plan*, uint64_t, uint64_t);
-
-static inline void
-si_lru_add(struct vinyl_index *index, struct svref *ref)
-{
-	index->lru_intr_sum += ref->v->size;
-	if (unlikely(index->lru_intr_sum >= index->conf.lru_step))
-	{
-		uint64_t lsn = vy_sequence(index->env->seq, VINYL_LSN);
-		index->lru_v += (lsn - index->lru_intr_lsn);
-		index->lru_steps++;
-		index->lru_intr_lsn = lsn;
-		index->lru_intr_sum = 0;
-	}
-}
-
-static inline uint64_t
-si_lru_vlsn_of(struct vinyl_index *i)
-{
-	assert(i->conf.lru_step != 0);
-	uint64_t size = i->size;
-	if (likely(size <= i->conf.lru))
-		return 0;
-	uint64_t lru_v = i->lru_v;
-	uint64_t lru_steps = i->lru_steps;
-	uint64_t lru_avg_step;
-	uint64_t oversize = size - i->conf.lru;
-	uint64_t steps = 1 + oversize / i->conf.lru_step;
-	lru_avg_step = lru_v / lru_steps;
-	return i->lru_intr_lsn + (steps * lru_avg_step);
-}
-
-static inline uint64_t
-si_lru_vlsn(struct vinyl_index *i)
-{
-	if (likely(i->conf.lru == 0))
-		return 0;
-	vy_index_lock(i);
-	int rc = si_lru_vlsn_of(i);
-	vy_index_unlock(i);
-	return rc;
-}
+si_execute(struct vinyl_index*, struct sdc*, struct vy_plan*, uint64_t);
 
 struct PACKED sicachebranch {
 	struct vy_run *branch;
@@ -5452,14 +5167,12 @@ static int vy_index_droprepository(char*, int);
 
 static int
 si_merge(struct vinyl_index*, struct sdc*, struct vy_range*, uint64_t,
-	 uint64_t, struct svmergeiter*, uint64_t, uint32_t);
+	 struct svmergeiter*, uint64_t, uint32_t);
 
 static int vy_run(struct vinyl_index*, struct sdc*, struct vy_plan*, uint64_t);
 static int
 si_compact(struct vinyl_index*, struct sdc*, struct vy_plan*, uint64_t,
-	   uint64_t, struct vy_iter*, uint64_t);
-static int
-vy_index_compact(struct vinyl_index*, struct sdc*, struct vy_plan*, uint64_t, uint64_t);
+	   struct vy_iter*, uint64_t);
 
 typedef rb_tree(struct vy_range) vy_range_id_tree_t;
 
@@ -5595,7 +5308,7 @@ vy_plan(struct vinyl_index *index, struct vy_plan *plan)
 
 static int
 si_execute(struct vinyl_index *index, struct sdc *c, struct vy_plan *plan,
-	   uint64_t vlsn, uint64_t vlsn_lru)
+	   uint64_t vlsn)
 {
 	int rc = -1;
 	switch (plan->plan) {
@@ -5607,13 +5320,9 @@ si_execute(struct vinyl_index *index, struct sdc *c, struct vy_plan *plan,
 	case SI_AGE:
 		rc = vy_run(index, c, plan, vlsn);
 		break;
-	case SI_LRU:
 	case SI_GC:
 	case SI_COMPACT:
-		rc = si_compact(index, c, plan, vlsn, vlsn_lru, NULL, 0);
-		break;
-	case SI_COMPACT_INDEX:
-		rc = vy_index_compact(index, c, plan, vlsn, vlsn_lru);
+		rc = si_compact(index, c, plan, vlsn, NULL, 0);
 		break;
 	default:
 		unreachable();
@@ -5726,7 +5435,7 @@ vy_branch_write_page(struct vy_file *file, struct svwriteiter *iwrite,
 	}
 	if (vy_file_writev(file, &iov) < 0) {
 		vy_error("file '%s' write error: %s",
-		               vy_path_of(&file->path),
+		               file->path,
 		               strerror(errno));
 		goto err;
 	}
@@ -5795,7 +5504,7 @@ vy_branch_write(struct vy_file *file, struct svwriteiter *iwrite,
 	sd_sealset_open(&seal);
 	if (vy_file_write(file, &seal, sizeof(struct sdseal)) < 0) {
 		vy_error("file '%s' write error: %s",
-		               vy_path_of(&file->path),
+		               file->path,
 		               strerror(errno));
 		goto err;
 	}
@@ -5840,13 +5549,13 @@ vy_branch_write(struct vy_file *file, struct svwriteiter *iwrite,
 	if (vy_file_writev(file, &iov) < 0 ||
 		vy_file_pwrite(file, seal_offset, &seal, sizeof(struct sdseal)) < 0) {
 		vy_error("file '%s' write error: %s",
-		               vy_path_of(&file->path),
+		               file->path,
 		               strerror(errno));
 		goto err;
 	}
 	if (vy_file_sync(file) == -1) {
 		vy_error("index file '%s' sync error: %s",
-		               vy_path_of(&file->path), strerror(errno));
+		               file->path, strerror(errno));
 		return -1;
 	}
 
@@ -5880,7 +5589,7 @@ vy_run_create(struct vinyl_index *index, struct sdc *c,
 	sv_writeiter_open(&iwrite, &imerge,
 			  index->key_def->opts.page_size,
 			  sizeof(struct sdv),
-			  vlsn, 0, 1, 1);
+			  vlsn, 1, 1);
 	struct sdid id;
 	id.flags = SD_IDBRANCH;
 	id.id = vy_sequence(env->seq, VINYL_NSN_NEXT);
@@ -5967,10 +5676,7 @@ vy_run(struct vinyl_index *index, struct sdc *c, struct vy_plan *plan, uint64_t 
 
 static int
 si_compact(struct vinyl_index *index, struct sdc *c, struct vy_plan *plan,
-	   uint64_t vlsn,
-	   uint64_t vlsn_lru,
-	   struct vy_iter *vindex,
-	   uint64_t vindex_used)
+	   uint64_t vlsn, struct vy_iter *vindex, uint64_t vindex_used)
 {
 	struct vy_range *node = plan->node;
 	assert(node->flags & SI_LOCK);
@@ -6029,32 +5735,9 @@ si_compact(struct vinyl_index *index, struct sdc *c, struct vy_plan *plan,
 	}
 	struct svmergeiter im;
 	sv_mergeiter_open(&im, &merge, VINYL_GE);
-	rc = si_merge(index, c, node, vlsn, vlsn_lru, &im, size_stream, count);
+	rc = si_merge(index, c, node, vlsn, &im, size_stream, count);
 	sv_mergefree(&merge);
 	return rc;
-}
-
-static int
-vy_index_compact(struct vinyl_index *index, struct sdc *c,
-		 struct vy_plan *plan, uint64_t vlsn,
-		 uint64_t vlsn_lru)
-{
-	struct vy_range *node = plan->node;
-
-	vy_index_lock(index);
-	if (unlikely(node->used == 0)) {
-		vy_range_unlock(node);
-		vy_index_unlock(index);
-		return 0;
-	}
-	struct svindex *vindex;
-	vindex = vy_range_rotate(node);
-	vy_index_unlock(index);
-
-	uint64_t size_stream = vindex->used;
-	struct vy_iter i;
-	sv_indexiter_open(&i, vindex, VINYL_GE, NULL, 0);
-	return si_compact(index, c, plan, vlsn, vlsn_lru, &i, size_stream);
 }
 
 static int vy_index_droprepository(char *repo, int drop_directory)
@@ -6122,15 +5805,15 @@ static int vy_index_dropmark(struct vinyl_index *i)
 
 static int vy_index_drop(struct vinyl_index *i)
 {
-	struct vy_path path;
-	vy_path_format(&path, "%s", i->conf.path);
+	char path[PATH_MAX];
+	snprintf(path, PATH_MAX, "%s", i->conf.path);
 	/* drop file must exists at this point */
 	/* shutdown */
 	int rc = vinyl_index_delete(i);
 	if (unlikely(rc == -1))
 		return -1;
 	/* remove directory */
-	rc = vy_index_droprepository(path.path, 1);
+	rc = vy_index_droprepository(path, 1);
 	return rc;
 }
 
@@ -6257,8 +5940,7 @@ si_split(struct vinyl_index *index, struct sdc *c, struct vy_buf *result,
          uint64_t  size_node,
          uint64_t  size_stream,
          uint32_t  stream,
-         uint64_t  vlsn,
-         uint64_t  vlsn_lru)
+         uint64_t  vlsn)
 {
 	(void) stream;
 	(void) size_node;
@@ -6270,7 +5952,7 @@ si_split(struct vinyl_index *index, struct sdc *c, struct vy_buf *result,
 	struct svwriteiter iwrite;
 	sv_writeiter_open(&iwrite, merge_iter,
 			  index->key_def->opts.page_size, sizeof(struct sdv),
-			  vlsn, vlsn_lru, 0, 0);
+			  vlsn, 0, 0);
 
 	while (sv_writeiter_has(&iwrite)) {
 		struct vy_page_index sdindex;
@@ -6316,8 +5998,8 @@ error:
 
 static int
 si_merge(struct vinyl_index *index, struct sdc *c, struct vy_range *range,
-	 uint64_t vlsn, uint64_t vlsn_lru,
-	 struct svmergeiter *stream, uint64_t size_stream, uint32_t n_stream)
+	 uint64_t vlsn, struct svmergeiter *stream, uint64_t size_stream,
+	 uint32_t n_stream)
 {
 	struct vinyl_env *env = index->env;
 	struct vy_buf *result = &c->a;
@@ -6331,7 +6013,7 @@ si_merge(struct vinyl_index *index, struct sdc *c, struct vy_range *range,
 	int rc;
 	rc = si_split(index, c, result, range, stream,
 		      index->key_def->opts.node_size,
-		      size_stream, n_stream, vlsn, vlsn_lru);
+		      size_stream, n_stream, vlsn);
 	if (unlikely(rc == -1))
 		return -1;
 
@@ -6366,7 +6048,7 @@ si_merge(struct vinyl_index *index, struct sdc *c, struct vy_range *range,
 	/* commit compaction changes */
 	vy_index_lock(index);
 	struct svindex *j = vy_range_index(range);
-	vy_planner_remove(&index->p, SI_COMPACT|SI_BRANCH|SI_TEMP, range);
+	vy_planner_remove(&index->p, SI_COMPACT|SI_BRANCH, range);
 	vy_range_split(range);
 	index->size -= vy_range_size(range);
 	switch (count) {
@@ -6384,7 +6066,7 @@ si_merge(struct vinyl_index *index, struct sdc *c, struct vy_range *range,
 		index->size += vy_range_size(n);
 		vy_range_lock(n);
 		si_replace(index, range, n);
-		vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH|SI_TEMP, n);
+		vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH, n);
 		break;
 	default: /* split */
 		rc = si_redistribute(index, c, range, result);
@@ -6401,7 +6083,7 @@ si_merge(struct vinyl_index *index, struct sdc *c, struct vy_range *range,
 		index->size += vy_range_size(n);
 		vy_range_lock(n);
 		si_replace(index, range, n);
-		vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH|SI_TEMP, n);
+		vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH, n);
 		for (vy_bufiter_next(&i); vy_bufiter_has(&i);
 		     vy_bufiter_next(&i)) {
 			n = vy_bufiterref_get(&i);
@@ -6411,7 +6093,7 @@ si_merge(struct vinyl_index *index, struct sdc *c, struct vy_range *range,
 			index->size += vy_range_size(n);
 			vy_range_lock(n);
 			si_insert(index, n);
-			vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH|SI_TEMP, n);
+			vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH, n);
 		}
 		break;
 	}
@@ -6443,21 +6125,9 @@ si_merge(struct vinyl_index *index, struct sdc *c, struct vy_range *range,
 	             return -1);
 
 	/* gc range */
-	uint16_t refs = vy_range_refof(range);
-	if (likely(refs == 0)) {
-		rc = vy_range_free(range, env, 1);
-		if (unlikely(rc == -1))
-			return -1;
-	} else {
-		/* range concurrently being read, schedule for
-		 * delayed removal */
-		vy_range_gc(range, &index->conf);
-		vy_index_lock(index);
-		rlist_add(&index->gc, &range->gc);
-		index->gc_count++;
-		vy_index_unlock(index);
-	}
-
+	rc = vy_range_free(range, env, 1);
+	if (unlikely(rc == -1))
+		return -1;
 	VINYL_INJECTION(r->i, VINYL_INJECTION_SI_COMPACTION_2,
 	             vy_error("%s", "error injection");
 	             return -1);
@@ -6498,7 +6168,6 @@ vy_range_new(struct key_def *key_def)
 		return NULL;
 	}
 	n->recover = 0;
-	n->lru = 0;
 	n->ac = 0;
 	n->flags = 0;
 	n->update_time = 0;
@@ -6515,7 +6184,6 @@ vy_range_new(struct key_def *key_def)
 	sv_indexinit(&n->i1, key_def);
 	ss_rqinitnode(&n->nodecompact);
 	ss_rqinitnode(&n->nodebranch);
-	ss_rqinitnode(&n->nodetemp);
 	rlist_create(&n->gc);
 	rlist_create(&n->commit);
 	return n;
@@ -6536,7 +6204,7 @@ vy_range_close(struct vy_range *n, struct vinyl_env *env, int gc)
 	int rc = vy_file_close(&n->file);
 	if (unlikely(rc == -1)) {
 		vy_error("index file '%s' close error: %s",
-		               vy_path_of(&n->file.path),
+		               n->file.path,
 		               strerror(errno));
 		rcret = -1;
 	}
@@ -6598,20 +6266,20 @@ e1:
 }
 
 static int
-vy_range_open(struct vy_range *n, struct vinyl_env *env, struct vy_path *path)
+vy_range_open(struct vy_range *n, struct vinyl_env *env, char *path)
 {
-	int rc = vy_file_open(&n->file, path->path);
+	int rc = vy_file_open(&n->file, path);
 	if (unlikely(rc == -1)) {
 		vy_error("index file '%s' open error: %s "
 		               "(please ensure storage version compatibility)",
-		               vy_path_of(&n->file.path),
+		               n->file.path,
 		               strerror(errno));
 		return -1;
 	}
 	rc = vy_file_seek(&n->file, n->file.size);
 	if (unlikely(rc == -1)) {
 		vy_error("index file '%s' seek error: %s",
-		               vy_path_of(&n->file.path),
+		               n->file.path,
 		               strerror(errno));
 		return -1;
 	}
@@ -6625,13 +6293,13 @@ static int
 vy_range_create(struct vy_range *n, struct vy_index_conf *scheme,
 	      struct sdid *id)
 {
-	struct vy_path path;
-	vy_path_compound(&path, scheme->path, id->parent, id->id,
+	char path[PATH_MAX];
+	vy_path_compound(path, scheme->path, id->parent, id->id,
 	                ".index.incomplete");
-	int rc = vy_file_new(&n->file, path.path);
+	int rc = vy_file_new(&n->file, path);
 	if (unlikely(rc == -1)) {
 		vy_error("index file '%s' create error: %s",
-		               path.path, strerror(errno));
+		               path, strerror(errno));
 		return -1;
 	}
 	return 0;
@@ -6654,12 +6322,12 @@ static int vy_range_free(struct vy_range *n, struct vinyl_env *env, int gc)
 {
 	int rcret = 0;
 	int rc;
-	if (gc && vy_path_is_set(&n->file.path)) {
+	if (gc && n->file.path[0]) {
 		vy_file_advise(&n->file, 0, 0, n->file.size);
-		rc = unlink(vy_path_of(&n->file.path));
+		rc = unlink(n->file.path);
 		if (unlikely(rc == -1)) {
 			vy_error("index file '%s' unlink error: %s",
-			               vy_path_of(&n->file.path),
+			               n->file.path,
 			               strerror(errno));
 			rcret = -1;
 		}
@@ -6679,19 +6347,19 @@ static int vy_range_seal(struct vy_range *n, struct vy_index_conf *scheme)
 		rc = vy_file_sync(&n->file);
 		if (unlikely(rc == -1)) {
 			vy_error("index file '%s' sync error: %s",
-			               vy_path_of(&n->file.path),
+			               n->file.path,
 			               strerror(errno));
 			return -1;
 		}
 	}
-	struct vy_path path;
-	vy_path_compound(&path, scheme->path,
+	char path[PATH_MAX];
+	vy_path_compound(path, scheme->path,
 	                n->self.id.parent, n->self.id.id,
 	                ".index.seal");
-	rc = vy_file_rename(&n->file, path.path);
+	rc = vy_file_rename(&n->file, path);
 	if (unlikely(rc == -1)) {
 		vy_error("index file '%s' rename error: %s",
-		               vy_path_of(&n->file.path),
+		               n->file.path,
 		               strerror(errno));
 		return -1;
 	}
@@ -6701,25 +6369,12 @@ static int vy_range_seal(struct vy_range *n, struct vy_index_conf *scheme)
 static int
 vy_range_complete(struct vy_range *n, struct vy_index_conf *scheme)
 {
-	struct vy_path path;
-	vy_path_init(&path, scheme->path, n->self.id.id, ".index");
-	int rc = vy_file_rename(&n->file, path.path);
+	char path[PATH_MAX];
+	vy_path_init(path, scheme->path, n->self.id.id, ".index");
+	int rc = vy_file_rename(&n->file, path);
 	if (unlikely(rc == -1)) {
 		vy_error("index file '%s' rename error: %s",
-		               vy_path_of(&n->file.path),
-		               strerror(errno));
-	}
-	return rc;
-}
-
-static int vy_range_gc(struct vy_range *n, struct vy_index_conf *scheme)
-{
-	struct vy_path path;
-	vy_path_init(&path, scheme->path, n->self.id.id, ".index.gc");
-	int rc = vy_file_rename(&n->file, path.path);
-	if (unlikely(rc == -1)) {
-		vy_error("index file '%s' rename error: %s",
-		               vy_path_of(&n->file.path),
+		               n->file.path,
 		               strerror(errno));
 	}
 	return rc;
@@ -6727,12 +6382,7 @@ static int vy_range_gc(struct vy_range *n, struct vy_index_conf *scheme)
 
 static int vy_plan_init(struct vy_plan *p)
 {
-	p->plan    = SI_NONE;
-	p->explain = SI_ENONE;
-	p->a       = 0;
-	p->b       = 0;
-	p->c       = 0;
-	p->node    = NULL;
+	memset(p, 0, sizeof(*p));
 	return 0;
 }
 
@@ -6771,8 +6421,6 @@ static int vy_planner_update(struct vy_planner *p, int mask, struct vy_range *n)
 		ss_rqupdate(&p->branch, &n->nodebranch, n->used);
 	if (mask & SI_COMPACT)
 		ss_rqupdate(&p->compact, &n->nodecompact, n->branch_count);
-	if (mask & SI_TEMP)
-		ss_rqupdate(&p->temp, &n->nodetemp, n->temperature);
 	return 0;
 }
 
@@ -6782,8 +6430,6 @@ static int vy_planner_remove(struct vy_planner *p, int mask, struct vy_range *n)
 		ss_rqdelete(&p->branch, &n->nodebranch);
 	if (mask & SI_COMPACT)
 		ss_rqdelete(&p->compact, &n->nodecompact);
-	if (mask & SI_TEMP)
-		ss_rqdelete(&p->temp, &n->nodetemp);
 	return 0;
 }
 
@@ -6798,7 +6444,7 @@ vy_planner_peek_checkpoint(struct vy_planner *p, struct vy_plan *plan)
 	struct ssrqnode *pn = NULL;
 	while ((pn = ss_rqprev(&p->branch, pn))) {
 		n = container_of(pn, struct vy_range, nodebranch);
-		if (n->i0.lsnmin <= plan->a) {
+		if (n->i0.lsnmin <= plan->checkpoint.lsn) {
 			if (n->flags & SI_LOCK) {
 				rc_inprogress = 2;
 				continue;
@@ -6826,7 +6472,7 @@ vy_planner_peek_branch(struct vy_planner *p, struct vy_plan *plan)
 		n = container_of(pn, struct vy_range, nodebranch);
 		if (n->flags & SI_LOCK)
 			continue;
-		if (n->used >= plan->a)
+		if (n->used >= plan->branch.index_size)
 			goto match;
 		return 0;
 	}
@@ -6852,7 +6498,8 @@ vy_planner_peek_age(struct vy_planner *p, struct vy_plan *plan)
 		n = container_of(pn, struct vy_range, nodebranch);
 		if (n->flags & SI_LOCK)
 			continue;
-		if (n->used >= plan->b && ((now - n->update_time) >= plan->a))
+		if (n->used >= plan->age.ttl_wm &&
+		    ((now - n->update_time) >= plan->age.ttl))
 			goto match;
 	}
 	return 0;
@@ -6874,7 +6521,7 @@ vy_planner_peek_compact(struct vy_planner *p, struct vy_plan *plan)
 		n = container_of(pn, struct vy_range, nodecompact);
 		if (n->flags & SI_LOCK)
 			continue;
-		if (n->branch_count >= plan->a)
+		if (n->branch_count >= plan->compact.branches)
 			goto match;
 		return 0;
 	}
@@ -6882,29 +6529,6 @@ vy_planner_peek_compact(struct vy_planner *p, struct vy_plan *plan)
 match:
 	vy_range_lock(n);
 	plan->explain = SI_EBRANCH_COUNT;
-	plan->node = n;
-	return 1;
-}
-
-static inline int
-vy_planner_peek_compact_temperature(struct vy_planner *p, struct vy_plan *plan)
-{
-	/* try to peek a hottest node with number of
-	 * branches >= watermark */
-	struct vy_range *n;
-	struct ssrqnode *pn = NULL;
-	while ((pn = ss_rqprev(&p->temp, pn))) {
-		n = container_of(pn, struct vy_range, nodetemp);
-		if (n->flags & SI_LOCK)
-			continue;
-		if (n->branch_count >= plan->a)
-			goto match;
-		return 0;
-	}
-	return 0;
-match:
-	vy_range_lock(n);
-	plan->explain = SI_ENONE;
 	plan->node = n;
 	return 1;
 }
@@ -6920,10 +6544,10 @@ vy_planner_peek_gc(struct vy_planner *p, struct vy_plan *plan)
 	while ((pn = ss_rqprev(&p->compact, pn))) {
 		n = container_of(pn, struct vy_range, nodecompact);
 		struct vy_page_index_header *h = &n->self.index.header;
-		if (likely(h->dupkeys == 0) || (h->dupmin >= plan->a))
+		if (likely(h->dupkeys == 0) || (h->dupmin >= plan->gc.lsn))
 			continue;
 		uint32_t used = (h->dupkeys * 100) / h->keys;
-		if (used >= plan->b) {
+		if (used >= plan->gc.percent) {
 			if (n->flags & SI_LOCK) {
 				rc_inprogress = 2;
 				continue;
@@ -6933,43 +6557,6 @@ vy_planner_peek_gc(struct vy_planner *p, struct vy_plan *plan)
 	}
 	if (rc_inprogress)
 		plan->explain = SI_ERETRY;
-	return rc_inprogress;
-match:
-	vy_range_lock(n);
-	plan->explain = SI_ENONE;
-	plan->node = n;
-	return 1;
-}
-
-static inline int
-vy_planner_peek_lru(struct vy_planner *p, struct vy_plan *plan)
-{
-	struct vinyl_index *index = p->i;
-	if (likely(! index->conf.lru))
-		return 0;
-	if (! index->lru_run_lsn) {
-		index->lru_run_lsn = si_lru_vlsn_of(index);
-		if (likely(index->lru_run_lsn == 0))
-			return 0;
-	}
-	int rc_inprogress = 0;
-	struct vy_range *n;
-	struct ssrqnode *pn = NULL;
-	while ((pn = ss_rqprev(&p->compact, pn))) {
-		n = container_of(pn, struct vy_range, nodecompact);
-		struct vy_page_index_header *h = &n->self.index.header;
-		if (h->lsnmin < index->lru_run_lsn) {
-			if (n->flags & SI_LOCK) {
-				rc_inprogress = 2;
-				continue;
-			}
-			goto match;
-		}
-	}
-	if (rc_inprogress)
-		plan->explain = SI_ERETRY;
-	else
-		index->lru_run_lsn = 0;
 	return rc_inprogress;
 match:
 	vy_range_lock(n);
@@ -7004,31 +6591,23 @@ vy_planner_peek_nodegc(struct vy_planner *p, struct vy_plan *plan)
 	struct vinyl_index *index = p->i;
 	if (likely(index->gc_count == 0))
 		return 0;
-	int rc_inprogress = 0;
 	struct vy_range *n;
 	rlist_foreach_entry(n, &index->gc, gc) {
-		if (likely(vy_range_refof(n) == 0)) {
-			rlist_del(&n->gc);
-			index->gc_count--;
-			plan->explain = SI_ENONE;
-			plan->node = n;
-			return 1;
-		} else {
-			rc_inprogress = 2;
-		}
+		rlist_del(&n->gc);
+		index->gc_count--;
+		plan->explain = SI_ENONE;
+		plan->node = n;
+		return 1;
 	}
-	return rc_inprogress;
+	return 0;
 }
 
 static int vy_planner(struct vy_planner *p, struct vy_plan *plan)
 {
 	switch (plan->plan) {
 	case SI_BRANCH:
-	case SI_COMPACT_INDEX:
 		return vy_planner_peek_branch(p, plan);
 	case SI_COMPACT:
-		if (plan->b == 1)
-			return vy_planner_peek_compact_temperature(p, plan);
 		return vy_planner_peek_compact(p, plan);
 	case SI_NODEGC:
 		return vy_planner_peek_nodegc(p, plan);
@@ -7038,8 +6617,6 @@ static int vy_planner(struct vy_planner *p, struct vy_plan *plan)
 		return vy_planner_peek_checkpoint(p, plan);
 	case SI_AGE:
 		return vy_planner_peek_age(p, plan);
-	case SI_LRU:
-		return vy_planner_peek_lru(p, plan);
 	case SI_SHUTDOWN:
 	case SI_DROP:
 		return vy_planner_peek_shutdown(p, plan);
@@ -7092,47 +6669,6 @@ vy_profiler_histogram_branch(struct vy_profiler *p)
 	}
 }
 
-static void
-vy_profiler_histogram_temperature(struct vy_profiler *p)
-{
-	/* build histogram */
-	static struct {
-		int nodes;
-		int branches;
-	} h[101];
-	memset(h, 0, sizeof(h));
-	struct vy_range *n;
-	struct ssrqnode *pn = NULL;
-	while ((pn = ss_rqprev(&p->i->p.temp, pn)))
-	{
-		n = container_of(pn, struct vy_range, nodetemp);
-		h[pn->v].nodes++;
-		h[pn->v].branches += n->branch_count;
-	}
-
-	/* prepare histogram string */
-	int count = 0;
-	int i = 100;
-	int size = 0;
-	while (i >= 0 && count < 10) {
-		if (h[i].nodes == 0) {
-			i--;
-			continue;
-		}
-		size += snprintf(p->histogram_temperature_sz + size,
-		                 sizeof(p->histogram_temperature_sz) - size,
-		                 "[%d]:%d-%d ", i,
-		                 h[i].nodes, h[i].branches);
-		i--;
-		count++;
-	}
-	if (size == 0)
-		p->histogram_temperature_ptr = NULL;
-	else {
-		p->histogram_temperature_ptr = p->histogram_temperature_sz;
-	}
-}
-
 static int vy_profiler_(struct vy_profiler *p)
 {
 	uint32_t temperature_total = 0;
@@ -7180,7 +6716,6 @@ static int vy_profiler_(struct vy_profiler *p)
 	p->read_cache = p->i->read_cache;
 
 	vy_profiler_histogram_branch(p);
-	vy_profiler_histogram_temperature(p);
 	return 0;
 }
 
@@ -7247,148 +6782,11 @@ si_readstat(struct siread *q, int cache, struct vy_range *n, uint32_t reads)
 		q->read_disk += reads;
 	}
 	/* update temperature */
-	if (index->conf.temperature) {
-		n->temperature_reads += reads;
-		uint64_t total = index->read_disk + index->read_cache;
-		if (unlikely(total == 0))
-			return;
-		n->temperature = (n->temperature_reads * 100ULL) / total;
-		vy_planner_update(&q->index->p, SI_TEMP, n);
-	}
-}
-
-static inline int
-si_getresult(struct siread *q, struct sv *v, int compare)
-{
-	int rc;
-	if (compare) {
-		rc = vy_tuple_compare(sv_pointer(v), q->key, q->merge.key_def);
-		if (unlikely(rc != 0))
-			return 0;
-	}
-	if (unlikely(q->has))
-		return sv_lsn(v) > q->vlsn;
-	if (unlikely(sv_is(v, SVDELETE)))
-		return 2;
-	rc = si_readdup(q, v);
-	if (unlikely(rc == -1))
-		return -1;
-	return 1;
-}
-
-static inline int
-si_getindex(struct siread *q, struct vy_range *n)
-{
-	struct svindex *second;
-	struct svindex *first = vy_range_index_priority(n, &second);
-
-	uint64_t lsn = q->has ? UINT64_MAX : q->vlsn;
-	struct svref *ref = sv_indexfind(first, q->key, q->keysize, lsn);
-	if (ref == NULL && second != NULL)
-		ref = sv_indexfind(second, q->key, q->keysize, lsn);
-	if (ref == NULL)
-		return 0;
-
-	si_readstat(q, 1, n, 1);
-	struct sv vret;
-	sv_from_tuple(&vret, ref->v);
-	return si_getresult(q, &vret, 0);
-}
-
-static inline int
-si_getbranch(struct siread *q, struct vy_range *n, struct sicachebranch *c)
-{
-	struct vy_run *b = c->branch;
-	struct vy_index_conf *conf= &q->index->conf;
-	int rc;
-	/* choose compression type */
-	int compression;
-	struct vy_filterif *compression_if;
-	compression    = conf->compression;
-	compression_if = conf->compression_if;
-	struct sdreadarg arg = {
-		.index           = &b->index,
-		.buf             = &c->buf_a,
-		.buf_xf          = &c->buf_b,
-		.buf_read        = &q->index->readbuf,
-		.index_iter      = &c->index_iter,
-		.page_iter       = &c->page_iter,
-		.use_compression = compression,
-		.compression_if  = compression_if,
-		.has             = q->has,
-		.has_vlsn        = q->vlsn,
-		.o               = VINYL_GE,
-		.file            = &n->file,
-		.key_def          = q->merge.key_def
-	};
-	rc = sd_read_open(&c->i, &arg, q->key, q->keysize);
-	int reads = sd_read_stat(&c->i);
-	si_readstat(q, 0, n, reads);
-	if (unlikely(rc <= 0))
-		return rc;
-	/* prepare sources */
-	sv_mergereset(&q->merge);
-	sv_mergeadd(&q->merge, &c->i);
-	struct svmergeiter im;
-	sv_mergeiter_open(&im, &q->merge, VINYL_GE);
-	uint64_t vlsn = q->vlsn;
-	if (unlikely(q->has))
-		vlsn = UINT64_MAX;
-	struct svreaditer ri;
-	sv_readiter_open(&ri, &im, vlsn, 1);
-	struct sv *v = sv_readiter_get(&ri);
-	if (unlikely(v == NULL)) {
-		sv_readiter_close(&ri);
-		return 0;
-	}
-	rc = si_getresult(q, v, 1);
-	sv_readiter_close(&ri);
-	return rc;
-}
-
-static inline int
-si_get(struct siread *q)
-{
-	assert(q->key != NULL);
-	struct vy_rangeiter ii;
-	vy_rangeiter_open(&ii, q->index, VINYL_GE, q->key, q->keysize);
-	struct vy_range *node;
-	node = vy_rangeiter_get(&ii);
-	assert(node != NULL);
-
-	/* search in memory */
-	int rc;
-	rc = si_getindex(q, node);
-	if (rc != 0)
-		return rc;
-	if (q->cache_only)
-		return 2;
-	struct vy_rangeview view;
-	vy_range_view_open(&view, node);
-	rc = si_cachevalidate(q->cache, node);
-	if (unlikely(rc == -1)) {
-		vy_oom();
-		return -1;
-	}
-	vy_index_unlock(q->index);
-
-	/* search on disk */
-	struct svmerge *m = &q->merge;
-	rc = sv_mergeprepare(m, 1);
-	assert(rc == 0);
-	struct sicachebranch *b;
-
-	b = q->cache->branch;
-	while (b && b->branch) {
-		rc = si_getbranch(q, node, b);
-		if (rc != 0)
-			break;
-		b = b->next;
-	}
-
-	vy_index_lock(q->index);
-	vy_range_view_close(&view);
-	return rc;
+	n->temperature_reads += reads;
+	uint64_t total = index->read_disk + index->read_cache;
+	if (unlikely(total == 0))
+		return;
+	n->temperature = (n->temperature_reads * 100ULL) / total;
 }
 
 static inline int
@@ -7704,7 +7102,7 @@ si_deploy(struct vinyl_index *index, struct vinyl_env *env, int create_directory
 		return -1;
 	}
 	si_insert(index, n);
-	vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH|SI_TEMP, n);
+	vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH, n);
 	index->size = vy_range_size(n);
 	return 1;
 }
@@ -7779,7 +7177,7 @@ si_trackdir(struct sitrack *track, struct vinyl_env *env, struct vinyl_index *i)
 		si_tracknsn(track, id);
 
 		struct vy_range *head, *node;
-		struct vy_path path;
+		char path[PATH_MAX];
 		switch (rc) {
 		case SI_RDB_DBI:
 		case SI_RDB_DBSEAL: {
@@ -7797,12 +7195,12 @@ si_trackdir(struct sitrack *track, struct vinyl_env *env, struct vinyl_index *i)
 			head->recover |= rc;
 			/* remove any incomplete file made during compaction */
 			if (rc == SI_RDB_DBI) {
-				vy_path_compound(&path, i->conf.path, id_parent, id,
+				vy_path_compound(path, i->conf.path, id_parent, id,
 				                ".index.incomplete");
-				rc = unlink(path.path);
+				rc = unlink(path);
 				if (unlikely(rc == -1)) {
 					vy_error("index file '%s' unlink error: %s",
-						 path.path, strerror(errno));
+						 path, strerror(errno));
 					goto error;
 				}
 				continue;
@@ -7813,9 +7211,9 @@ si_trackdir(struct sitrack *track, struct vinyl_env *env, struct vinyl_index *i)
 			if (unlikely(node == NULL))
 				goto error;
 			node->recover = SI_RDB_DBSEAL;
-			vy_path_compound(&path, i->conf.path, id_parent, id,
+			vy_path_compound(path, i->conf.path, id_parent, id,
 			                ".index.seal");
-			rc = vy_range_open(node, env, &path);
+			rc = vy_range_open(node, env, path);
 			if (unlikely(rc == -1)) {
 				vy_range_free(node, env, 0);
 				goto error;
@@ -7825,11 +7223,11 @@ si_trackdir(struct sitrack *track, struct vinyl_env *env, struct vinyl_index *i)
 			continue;
 		}
 		case SI_RDB_REMOVE:
-			vy_path_init(&path, i->conf.path, id, ".index.gc");
-			rc = unlink(vy_path_of(&path));
+			vy_path_init(path, i->conf.path, id, ".index.gc");
+			rc = unlink(path);
 			if (unlikely(rc == -1)) {
 				vy_error("index file '%s' unlink error: %s",
-					 vy_path_of(&path), strerror(errno));
+					 path, strerror(errno));
 				goto error;
 			}
 			continue;
@@ -7847,8 +7245,8 @@ si_trackdir(struct sitrack *track, struct vinyl_env *env, struct vinyl_index *i)
 		if (unlikely(node == NULL))
 			goto error;
 		node->recover = SI_RDB;
-		vy_path_init(&path, i->conf.path, id, ".index");
-		rc = vy_range_open(node, env, &path);
+		vy_path_init(path, i->conf.path, id, ".index");
+		rc = vy_range_open(node, env, path);
 		if (unlikely(rc == -1)) {
 			vy_range_free(node, env, 0);
 			goto error;
@@ -7951,7 +7349,7 @@ si_recovercomplete(struct sitrack *track, struct vinyl_env *env, struct vinyl_in
 		}
 		n->recover = SI_RDB;
 		si_insert(index, n);
-		vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH|SI_TEMP, n);
+		vy_planner_update(&index->p, SI_COMPACT|SI_BRANCH, n);
 		vy_bufiter_next(&i);
 	}
 	return 0;
@@ -8098,8 +7496,6 @@ si_write(struct txlogindex *li, uint64_t time,
 		/* update node */
 		range->used += vinyl_tuple_size(tuple);
 		quota += vinyl_tuple_size(tuple);
-		if (index->conf.lru)
-			si_lru_add(index, &ref);
 		if (rlist_empty(&range->commit))
 			rlist_add(&rangelist, &range->commit);
 	}
@@ -8119,7 +7515,6 @@ si_write(struct txlogindex *li, uint64_t time,
 enum {
 	SC_QBRANCH  = 0,
 	SC_QGC      = 1,
-	SC_QLRU     = 3,
 	SC_QMAX
 };
 
@@ -8144,8 +7539,6 @@ struct scheduler {
 	uint64_t       age_time;
 	uint64_t       gc_time;
 	uint32_t       gc;
-	uint64_t       lru_time;
-	uint32_t       lru;
 	int            rr;
 	int            count;
 	struct scdb         **i;
@@ -8162,6 +7555,10 @@ static int
 sc_add(struct scheduler*, struct vinyl_index*);
 static int
 sc_del(struct scheduler*, struct vinyl_index*, int);
+static void
+vy_workers_start(struct vinyl_env *env);
+static void
+vy_workers_stop(struct vinyl_env *env);
 
 static inline void
 sc_start(struct scheduler *s, int task)
@@ -8219,20 +7616,6 @@ sc_task_gc_done(struct scheduler *s, uint64_t now)
 }
 
 static inline void
-sc_task_lru(struct scheduler *s)
-{
-	s->lru = 1;
-	sc_start(s, SI_LRU);
-}
-
-static inline void
-sc_task_lru_done(struct scheduler *s, uint64_t now)
-{
-	s->lru = 0;
-	s->lru_time = now;
-}
-
-static inline void
 sc_task_age(struct scheduler *s)
 {
 	s->age = 1;
@@ -8246,11 +7629,8 @@ sc_task_age_done(struct scheduler *s, uint64_t now)
 	s->age_time = now;
 }
 
-static int sc_step(struct vinyl_service*, uint64_t);
-
 static int sc_ctl_checkpoint(struct scheduler*);
 static int sc_ctl_shutdown(struct scheduler*, struct vinyl_index*);
-
 
 static struct scheduler *
 scheduler_new(struct vinyl_env *env)
@@ -8269,8 +7649,6 @@ scheduler_new(struct vinyl_env *env)
 	s->age_time                 = now;
 	s->gc                       = 0;
 	s->gc_time                  = now;
-	s->lru                      = 0;
-	s->lru_time                 = now;
 	s->i                        = NULL;
 	s->count                    = 0;
 	s->rr                       = 0;
@@ -8404,8 +7782,7 @@ sc_execute(struct sctask *t, struct sdc *c, uint64_t vlsn)
 	/* regular task */
 	struct vinyl_index *index = t->db->index;
 	assert(index != NULL && index->refs > 0);
-	uint64_t vlsn_lru = si_lru_vlsn(index);
-	return si_execute(index, c, &t->plan, vlsn, vlsn_lru);
+	return si_execute(index, c, &t->plan, vlsn);
 }
 
 static inline struct scdb*
@@ -8502,7 +7879,7 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 	/* checkpoint */
 	if (s->checkpoint) {
 		task->plan.plan = SI_CHECKPOINT;
-		task->plan.a = s->checkpoint_lsn;
+		task->plan.checkpoint.lsn = s->checkpoint_lsn;
 		rc = sc_plan(s, &task->plan);
 		switch (rc) {
 		case 1:
@@ -8521,13 +7898,11 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 	/* garbage-collection */
 	if (s->gc) {
 		task->plan.plan = SI_GC;
-		task->plan.a = vlsn;
-		task->plan.b = zone->gc_wm;
+		task->plan.gc.lsn = vlsn;
+		task->plan.gc.percent = zone->gc_wm;
 		rc = sc_planquota(s, &task->plan, SC_QGC, zone->gc_prio);
 		switch (rc) {
 		case 1:
-			if (zone->mode == 0)
-				task->plan.plan = SI_COMPACT_INDEX;
 			assert(db->index != NULL && db->index->refs > 0);
 			vinyl_index_ref(db->index);
 			db->workers[SC_QGC]++;
@@ -8540,36 +7915,14 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 		}
 	}
 
-	/* lru */
-	if (s->lru) {
-		task->plan.plan = SI_LRU;
-		rc = sc_planquota(s, &task->plan, SC_QLRU, zone->lru_prio);
-		switch (rc) {
-		case 1:
-			if (zone->mode == 0)
-				task->plan.plan = SI_COMPACT_INDEX;
-			assert(db->index != NULL && db->index->refs > 0);
-			vinyl_index_ref(db->index);
-			db->workers[SC_QLRU]++;
-			task->db = db;
-			return 1;
-		case 0: /* complete */
-			if (sc_end(s, db, SI_LRU))
-				sc_task_lru_done(s, now);
-			break;
-		}
-	}
-
 	/* index aging */
 	if (s->age) {
 		task->plan.plan = SI_AGE;
-		task->plan.a = zone->branch_age * 1000000; /* ms */
-		task->plan.b = zone->branch_age_wm;
+		task->plan.age.ttl = zone->branch_age * 1000000; /* ms */
+		task->plan.age.ttl_wm = zone->branch_age_wm;
 		rc = sc_planquota(s, &task->plan, SC_QBRANCH, zone->branch_prio);
 		switch (rc) {
 		case 1:
-			if (zone->mode == 0)
-				task->plan.plan = SI_COMPACT_INDEX;
 			assert(db->index != NULL && db->index->refs > 0);
 			vinyl_index_ref(db->index);
 			db->workers[SC_QBRANCH]++;
@@ -8582,23 +7935,9 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 		}
 	}
 
-	/* compact_index (compaction with in-memory index) */
-	if (zone->mode == 0) {
-		task->plan.plan = SI_COMPACT_INDEX;
-		task->plan.a = zone->branch_wm;
-		rc = sc_plan(s, &task->plan);
-		if (rc == 1) {
-			assert(db->index != NULL && db->index->refs > 0);
-			vinyl_index_ref(db->index);
-			task->db = db;
-			return 1;
-		}
-		goto no_job;
-	}
-
 	/* branching */
 	task->plan.plan = SI_BRANCH;
-	task->plan.a = zone->branch_wm;
+	task->plan.branch.index_size = zone->branch_wm;
 	rc = sc_planquota(s, &task->plan, SC_QBRANCH, zone->branch_prio);
 	if (rc == 1) {
 		db->workers[SC_QBRANCH]++;
@@ -8610,8 +7949,7 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 
 	/* compaction */
 	task->plan.plan = SI_COMPACT;
-	task->plan.a = zone->compact_wm;
-	task->plan.b = zone->compact_mode;
+	task->plan.compact.branches = zone->compact_wm;
 	rc = sc_plan(s, &task->plan);
 	if (rc == 1) {
 		assert(db->index != NULL && db->index->refs > 0);
@@ -8620,7 +7958,6 @@ sc_do(struct scheduler *s, struct sctask *task, struct srzone *zone,
 		return 1;
 	}
 
-no_job:
 	vy_plan_init(&task->plan);
 	return 0;
 }
@@ -8634,9 +7971,6 @@ sc_periodic_done(struct scheduler *s, uint64_t now)
 	/* gc */
 	if (unlikely(s->gc))
 		sc_task_gc_done(s, now);
-	/* lru */
-	if (unlikely(s->lru))
-		sc_task_lru_done(s, now);
 	/* age */
 	if (unlikely(s->age))
 		sc_task_age_done(s, now);
@@ -8647,31 +7981,10 @@ sc_periodic(struct scheduler *s, struct srzone *zone, uint64_t now)
 {
 	if (unlikely(s->count == 0))
 		return;
-	/* checkpoint */
-	switch (zone->mode) {
-	case 0:  /* compact_index */
-		break;
-	case 1:  /* compact_index + branch_count prio */
-		unreachable();
-		break;
-	case 2:  /* checkpoint */
-	{
-		if (!s->checkpoint)
-			sc_task_checkpoint(s);
-		break;
-	}
-	default: /* branch + compact */
-		assert(zone->mode == 3);
-	}
 	/* gc */
 	if (s->gc == 0 && zone->gc_prio && zone->gc_period) {
 		if ((now - s->gc_time) >= zone->gc_period_us)
 			sc_task_gc(s);
-	}
-	/* lru */
-	if (s->lru == 0 && zone->lru_prio && zone->lru_period) {
-		if ((now - s->lru_time) >= zone->lru_period_us)
-			sc_task_lru(s);
 	}
 	/* aging */
 	if (s->age == 0 && zone->branch_prio && zone->branch_age_period) {
@@ -8681,11 +7994,10 @@ sc_periodic(struct scheduler *s, struct srzone *zone, uint64_t now)
 }
 
 static int
-sc_schedule(struct sctask *task, struct vinyl_service *srv, uint64_t vlsn)
+sc_schedule(struct vinyl_env *env, struct sctask *task, int64_t vlsn)
 {
 	uint64_t now = clock_monotonic64();
-	struct scheduler *sc = srv->env->scheduler;
-	struct vinyl_env *env = sc->env;
+	struct scheduler *sc = env->scheduler;
 	struct srzone *zone = sr_zoneof(env);
 	int rc;
 	tt_pthread_mutex_lock(&sc->lock);
@@ -8725,13 +8037,8 @@ sc_complete(struct scheduler *s, struct sctask *t)
 	case SI_CHECKPOINT:
 		db->workers[SC_QBRANCH]--;
 		break;
-	case SI_COMPACT_INDEX:
-		break;
 	case SI_GC:
 		db->workers[SC_QGC]--;
-		break;
-	case SI_LRU:
-		db->workers[SC_QLRU]--;
 		break;
 	case SI_SHUTDOWN:
 	case SI_DROP:
@@ -8758,12 +8065,12 @@ sc_taskinit(struct sctask *task)
 }
 
 static int
-sc_step(struct vinyl_service *srv, uint64_t vlsn)
+sc_step(struct vinyl_env *env, struct sdc *sdc, uint64_t vlsn)
 {
-	struct scheduler *sc = srv->env->scheduler;
+	struct scheduler *sc = env->scheduler;
 	struct sctask task;
 	sc_taskinit(&task);
-	int rc = sc_schedule(&task, srv, vlsn);
+	int rc = sc_schedule(env, &task, vlsn);
 	if (task.plan.plan == 0) {
 		/*
 		 * TODO: no-op task.
@@ -8775,7 +8082,7 @@ sc_step(struct vinyl_service *srv, uint64_t vlsn)
 	}
 	int rc_job = rc;
 	if (rc_job > 0) {
-		rc = sc_execute(&task, &srv->sdc, vlsn);
+		rc = sc_execute(&task, sdc, vlsn);
 		if (unlikely(rc == -1)) {
 			if (task.db != NULL) {
 				vy_status_set(&task.db->index->status,
@@ -8840,9 +8147,7 @@ vy_conf_new()
 	conf->memory_limit = cfg_getd("vinyl.memory_limit")*1024*1024*1024;
 	struct srzone def = {
 		.enable            = 1,
-		.mode              = 3, /* branch + compact */
 		.compact_wm        = 2,
-		.compact_mode      = 0, /* branch priority */
 		.branch_prio       = 1,
 		.branch_wm         = 10 * 1024 * 1024,
 		.branch_age        = 40,
@@ -8851,14 +8156,10 @@ vy_conf_new()
 		.gc_prio           = 1,
 		.gc_period         = 60,
 		.gc_wm             = 30,
-		.lru_prio          = 0,
-		.lru_period        = 0
 	};
 	struct srzone redzone = {
 		.enable            = 1,
-		.mode              = 2, /* checkpoint */
 		.compact_wm        = 4,
-		.compact_mode      = 0,
 		.branch_prio       = 0,
 		.branch_wm         = 0,
 		.branch_age        = 0,
@@ -8867,8 +8168,6 @@ vy_conf_new()
 		.gc_prio           = 0,
 		.gc_period         = 0,
 		.gc_wm             = 0,
-		.lru_prio          = 0,
-		.lru_period        = 0
 	};
 	sr_zonemap_set(&conf->zones, 0, &def);
 	sr_zonemap_set(&conf->zones, 80, &redzone);
@@ -8890,7 +8189,6 @@ vy_conf_new()
 		z = &conf->zones.zones[i];
 		z->branch_age_period_us = z->branch_age_period * 1000000;
 		z->gc_period_us         = z->gc_period * 1000000;
-		z->lru_period_us        = z->lru_period * 1000000;
 	}
 	return conf;
 
@@ -9022,17 +8320,13 @@ vy_info_append_compaction(struct vy_info *info, struct vy_info_node *root)
 		struct vy_info_node *local_node = vy_info_append(node, z->name);
 		if (vy_info_reserve(info, local_node, 13) != 0)
 			return 1;
-		vy_info_append_u32(local_node, "mode", z->mode);
 		vy_info_append_u32(local_node, "gc_wm", z->gc_wm);
 		vy_info_append_u32(local_node, "gc_prio", z->gc_prio);
-		vy_info_append_u32(local_node, "lru_prio", z->lru_prio);
 		vy_info_append_u32(local_node, "branch_wm", z->branch_wm);
 		vy_info_append_u32(local_node, "gc_period", z->gc_period);
-		vy_info_append_u32(local_node, "lru_period", z->lru_period);
 		vy_info_append_u32(local_node, "branch_age", z->branch_age);
 		vy_info_append_u32(local_node, "compact_wm", z->compact_wm);
 		vy_info_append_u32(local_node, "branch_prio", z->branch_prio);
-		vy_info_append_u32(local_node, "compact_mode", z->compact_mode);
 		vy_info_append_u32(local_node, "branch_age_wm", z->branch_age_wm);
 		vy_info_append_u32(local_node, "branch_age_period", z->branch_age_period);
 	}
@@ -9054,7 +8348,6 @@ vy_info_append_scheduler(struct vy_info *info, struct vy_info_node *root)
 	struct scheduler *scheduler = env->scheduler;
 	tt_pthread_mutex_lock(&scheduler->lock);
 	vy_info_append_u32(node, "gc_active", scheduler->gc);
-	vy_info_append_u32(node, "lru_active", scheduler->lru);
 	tt_pthread_mutex_unlock(&scheduler->lock);
 	return 0;
 }
@@ -9077,7 +8370,6 @@ vy_info_append_performance(struct vy_info *info, struct vy_info_node *root)
 	vy_info_append_u64(node, "upsert", stat->upsert);
 	vy_info_append_u64(node, "cursor", stat->cursor);
 	vy_info_append_str(node, "tx_ops", stat->tx_stmts.sz);
-	vy_info_append_u64(node, "tx_lock", stat->tx_lock);
 	vy_info_append_u64(node, "documents", stat->v_count);
 	vy_info_append_str(node, "tx_latency", stat->tx_latency.sz);
 	vy_info_append_str(node, "cursor_ops", stat->cursor_ops.sz);
@@ -9150,7 +8442,6 @@ vy_info_append_indices(struct vy_info *info, struct vy_info_node *root)
 		vy_info_append_u32(local_node, "temperature_max", o->rtp.temperature_max);
 		vy_info_append_str(local_node, "branch_histogram", o->rtp.histogram_branch_ptr);
 		vy_info_append_u64(local_node, "size_uncompressed", o->rtp.total_node_origin_size);
-		vy_info_append_str(local_node, "temperature_histogram", o->rtp.histogram_temperature_ptr);
 	}
 	return 0;
 }
@@ -9324,7 +8615,6 @@ vy_index_conf_create(struct vy_index_conf *conf, struct key_def *key_def)
 		goto error;
 	}
 
-	conf->temperature           = 1;
 	/* path */
 	if (key_def->opts.path[0] == '\0') {
 		char path[1024];
@@ -9338,8 +8628,6 @@ vy_index_conf_create(struct vy_index_conf *conf, struct key_def *key_def)
 		vy_oom();
 		goto error;
 	}
-	conf->lru                   = 0;
-	conf->lru_step              = 128 * 1024;
 	conf->buf_gc_wm             = 1024 * 1024;
 
 	return 0;
@@ -9627,11 +8915,6 @@ vinyl_index_new(struct vinyl_env *e, struct key_def *key_def,
 	rlist_create(&index->gc);
 	index->gc_count = 0;
 	index->update_time = 0;
-	index->lru_run_lsn = 0;
-	index->lru_v = 0;
-	index->lru_steps = 1;
-	index->lru_intr_lsn = 0;
-	index->lru_intr_sum = 0;
 	index->size = 0;
 	index->read_disk = 0;
 	index->read_cache = 0;
@@ -9643,6 +8926,7 @@ vinyl_index_new(struct vinyl_env *e, struct key_def *key_def,
 	index->tsn_min = tx_manager_min(e->xm);
 	index->tsn_max = UINT64_MAX;
 	rlist_add(&e->indexes, &index->link);
+	vy_workers_start(e);
 	return index;
 
 error_4:
@@ -10163,43 +9447,8 @@ vy_tx_end(struct vy_stat *stat, struct vinyl_tx *tx, int rlb, int conflict)
 			txv_delete(m->env, v);
 		}
 	}
-	tx_gc(tx);
 	vy_stat_tx(stat, tx->start, count, rlb, conflict);
-	free(tx);
-}
-
-/**
- * Abort the transaction if there is a transaction with a newer
- * consistent read view which has already committed and modified
- * the data seen by this transaction. Despite multi-version
- * concurrency control, vinyl doesn't allow Thomas rule writes
- * or blind writes, because the binary log in Tarantool
- * stores entire transactions in their actual commit order, and thus
- * allowing such writes would break consistency after recovery or on
- * a replica.
- */
-static inline int
-vy_txprepare_cb(struct vinyl_tx *tx, struct txv *v, uint64_t lsn,
-		struct sicache *cache, enum vinyl_status status)
-{
-	if (lsn == tx->vlsn || status == VINYL_FINAL_RECOVERY)
-		return 0;
-
-	struct vinyl_tuple *key = v->tuple;
-	struct vinyl_index *index = v->index->index;
-
-	struct siread q;
-	si_readopen(&q, index, cache, VINYL_EQ, tx->vlsn, key->data, key->size);
-	q.has = 1;
-	int rc = si_get(&q);
-	si_readclose(&q);
-
-	if (unlikely(q.result))
-		vinyl_tuple_unref(index, q.result);
-	if (rc)
-		return 1;
-
-	return 0;
+	tx_delete(tx);
 }
 
 /* {{{ Public API of transaction control: start/end transaction,
@@ -10287,16 +9536,8 @@ vinyl_prepare(struct vinyl_env *e, struct vinyl_tx *tx)
 	/* prepare transaction */
 	assert(tx->state == VINYL_TX_READY);
 
-	struct sicache *cache = vy_cachepool_pop(e->cachepool);
-	if (unlikely(cache == NULL))
-		return vy_oom();
-	enum tx_state s = tx_prepare(tx, cache, e->status);
+	enum tx_state s = tx_prepare(tx);
 
-	vy_cachepool_push(cache);
-	if (s == VINYL_TX_LOCK) {
-		vy_stat_tx_lock(e->stat);
-		return 2;
-	}
 	if (s == VINYL_TX_ROLLBACK) {
 		return 1;
 	}
@@ -10573,6 +9814,7 @@ vinyl_env_delete(struct vinyl_env *e)
 {
 	int rcret = 0;
 	e->status = VINYL_SHUTDOWN;
+	vy_workers_stop(e);
 	/* TODO: tarantool doesn't delete indexes during shutdown */
 	//assert(rlist_empty(&e->db));
 	int rc;
@@ -10634,6 +9876,10 @@ vinyl_end_recovery(struct vinyl_env *e)
 int
 vinyl_checkpoint(struct vinyl_env *env)
 {
+	/* do not initiate checkpoint during bootstrap,
+	 * thread pool is not up yet */
+	if (! env->worker_pool_run)
+		return 0;
 	return sc_ctl_checkpoint(env->scheduler);
 }
 
@@ -10709,33 +9955,59 @@ vy_index_send(struct vinyl_index *index, vy_send_row_f sendrow, void *ctx)
 
 /** {{{ vinyl_service - context of a vinyl background thread */
 
-struct vinyl_service *
-vinyl_service_new(struct vinyl_env *env)
+static void*
+vinyl_worker(void *arg)
 {
-	struct vinyl_service *srv = malloc(sizeof(struct vinyl_service));
-	if (srv == NULL) {
-		vy_oom();
-		return NULL;
+	struct vinyl_env *env = (struct vinyl_env *) arg;
+	struct sdc sdc;
+	sd_cinit(&sdc);
+	while (pm_atomic_load_explicit(&env->worker_pool_run,
+				       pm_memory_order_relaxed)) {
+		int rc = 0;
+		if (vy_status_is_active(env->status)) {
+			rc = sc_step(env, &sdc,
+				     vy_sequence(env->seq, VINYL_VIEW_LSN));
+		}
+		if (rc == -1)
+			break;
+		if (rc == 0)
+			usleep(10000); /* 10ms */
 	}
-	srv->env = env;
-	sd_cinit(&srv->sdc);
-	return srv;
+	sd_cfree(&sdc);
+	return NULL;
 }
 
-int
-vinyl_service_do(struct vinyl_service *srv)
+static void
+vy_workers_start(struct vinyl_env *env)
 {
-	if (! vy_status_is_active(srv->env->status))
-		return 0;
-
-	return sc_step(srv, tx_manager_lsn(srv->env->xm));
+	if (env->worker_pool_run)
+		return;
+	/* prepare worker pool */
+	env->worker_pool = NULL;
+	env->worker_pool_size = cfg_geti("vinyl.threads");
+	if (env->worker_pool_size < 0)
+		env->worker_pool_size = 1;
+	env->worker_pool = (struct cord *)calloc(env->worker_pool_size,
+		sizeof(struct cord));
+	if (env->worker_pool == NULL)
+		panic("failed to allocate vinyl worker pool");
+	env->worker_pool_run = 1;
+	for (int i = 0; i < env->worker_pool_size; i++)
+		cord_start(&env->worker_pool[i], "vinyl", vinyl_worker, env);
 }
 
-void
-vinyl_service_delete(struct vinyl_service *srv)
+static void
+vy_workers_stop(struct vinyl_env *env)
 {
-	sd_cfree(&srv->sdc);
-	free(srv);
+	if (!env->worker_pool_run)
+		return;
+	pm_atomic_store_explicit(&env->worker_pool_run, 0,
+				 pm_memory_order_relaxed);
+	for (int i = 0; i < env->worker_pool_size; i++)
+		cord_join(&env->worker_pool[i]);
+	free(env->worker_pool);
+	env->worker_pool = NULL;
+	env->worker_pool_size = 0;
 }
 
 /* }}} vinyl service */
