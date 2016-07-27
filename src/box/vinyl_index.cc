@@ -48,6 +48,16 @@
 #include "txn.h"
 #include "vinyl.h"
 
+static bool
+key_def_contains_fieldno(const struct key_def *key_def,
+			uint32_t fieldno)
+{
+	for (uint32_t i = 0; i < key_def->part_count; ++i)
+		if (key_def->parts[i].fieldno == fieldno)
+			return true;
+	return false;
+}
+
 VinylIndex::VinylIndex(struct key_def *key_def_arg)
 	: Index(key_def_arg)
 {
@@ -59,10 +69,20 @@ VinylIndex::VinylIndex(struct key_def *key_def_arg)
 
 	/* if index is not unique then add primary key to end of parts */
 	if (!key_def->opts.is_unique) {
+		uint32_t i, limit;
 		Index *primary = index_find(space, 0);
 		struct key_def *primary_def = primary->key_def;
 		int new_parts_count = key_def->part_count +
 			primary_def->part_count;
+		struct key_part *primary_parts = primary_def->parts;
+		/* remove parts doubles */
+		limit = primary_def->part_count;
+		for (i = 0; i < limit; ++i)
+			if (key_def_contains_fieldno(key_def,
+				primary_parts[i].fieldno))
+			{
+				--new_parts_count;
+			}
 
 		/* create new key_def with unique part */
 		struct key_def *new_def
@@ -79,12 +99,16 @@ VinylIndex::VinylIndex(struct key_def *key_def_arg)
 		 * Do this by key_def_set_part because this function
 		 * sets comparators for key_def
 		*/
-		uint32_t i = 0, offset = key_def->part_count;
-		uint32_t limit = primary_def->part_count;
-		struct key_part *primary_parts = primary_def->parts;
-		for (; i < limit; ++i, ++offset)
+		uint32_t offset = key_def->part_count;
+		limit = primary_def->part_count;
+		for (i = 0; i < limit; ++i)
 		{
-			key_def_set_part(new_def, offset,
+			if (key_def_contains_fieldno(key_def,
+				primary_parts[i].fieldno))
+			{
+				continue;
+			}
+			key_def_set_part(new_def, offset++,
 				primary_parts[i].fieldno,
 				primary_parts[i].type);
 		}
