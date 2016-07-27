@@ -202,7 +202,8 @@ VinylSpace::executeDelete(struct txn*, struct space *space,
 	const char *key = request->key;
 	uint32_t part_count = mp_decode_array(&key);
 	if (part_count != index->key_def->part_count) {
-		tnt_raise(ClientError, ER_MORE_THAN_ONE_TUPLE);
+		tnt_raise(ClientError, ER_EXACT_MATCH,
+			index->key_def->part_count, part_count);
 	}
 	if (space->index_count > 1) {
 		if (vinyl_coget(tx, index->db, key, part_count, &full_tuple) != 0) {
