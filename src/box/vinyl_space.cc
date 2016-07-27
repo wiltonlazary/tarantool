@@ -142,7 +142,7 @@ vinyl_execute_delete_tuple(struct space *space, struct tuple *tuple,
 	for (uint32_t iid = 0; iid < space->index_count; ++iid) {
 		index = (VinylIndex *)space->index[iid];
 		key = tuple_extract_key(tuple, index->key_def, &key_size);
-		part_count = mp_decode_array((const char **)&key);
+		part_count = mp_decode_array(&key);
 		if (vinyl_delete(tx, index->db, key, part_count) < 0)
 			return 1;
 	}
@@ -162,7 +162,7 @@ VinylSpace::executeReplace(struct txn*,
 	tuple_validate_raw(space->format, request->tuple);
 	struct vinyl_tx *tx = (struct vinyl_tx *)(in_txn()->engine_tx);
 
-	if (request->type == IPROTO_REPLACE) {
+	if ((request->type == IPROTO_REPLACE) && (space->index_count > 1)) {
 		struct tuple *full_tuple;
 		VinylIndex *primary = (VinylIndex *)index_find(space, 0);
 		uint32_t key_size;
@@ -204,12 +204,17 @@ VinylSpace::executeDelete(struct txn*, struct space *space,
 	if (part_count != index->key_def->part_count) {
 		tnt_raise(ClientError, ER_MORE_THAN_ONE_TUPLE);
 	}
-	if (vinyl_coget(tx, index->db, key, part_count, &full_tuple) != 0) {
-		diag_raise();
-		return NULL;
+	if (space->index_count > 1) {
+		if (vinyl_coget(tx, index->db, key, part_count, &full_tuple) != 0) {
+			diag_raise();
+			return NULL;
+		}
+		if (full_tuple && vinyl_execute_delete_tuple(space, full_tuple, tx))
+			diag_raise();
+	} else {
+		if (vinyl_delete(tx, index->db, key, part_count) < 0)
+			diag_raise();
 	}
-	if (full_tuple && vinyl_execute_delete_tuple(space, full_tuple, tx))
-		diag_raise();
 	return NULL;
 }
 
@@ -217,7 +222,7 @@ struct tuple *
 VinylSpace::executeUpdate(struct txn*, struct space *space,
                            struct request *request)
 {
-	int index_id = request->index_id;
+	uint32_t index_id = request->index_id;
 	/* find full tuple in index */
 	struct tuple *old_full_tuple = NULL;
 	VinylIndex *index = (VinylIndex *)index_find(space, index_id);
@@ -243,7 +248,10 @@ VinylSpace::executeUpdate(struct txn*, struct space *space,
 	uint32_t key_size;
 	for (uint32_t iid = 0; iid < space->index_count; ++iid) {
 		index = (VinylIndex *)space->index[iid];
-		key = tuple_extract_key(old_full_tuple, index->key_def, &key_size);
+		if (iid != index_id)
+			key = tuple_extract_key(old_full_tuple, index->key_def, &key_size);
+		else
+			key = request->key;
 		part_count = mp_decode_array(&key);
 		if (vinyl_delete(tx, index->db, key, part_count) < 0) {
 			diag_raise();
