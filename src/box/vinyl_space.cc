@@ -230,6 +230,13 @@ VinylSpace::executeUpdate(struct txn*, struct space *space,
 	struct vinyl_tx *tx = (struct vinyl_tx *)(in_txn()->engine_tx);
 	const char *key = request->key;
 	uint32_t part_count = mp_decode_array(&key);
+	if (!index->key_def->opts.is_unique) {
+		tnt_raise(ClientError, ER_MORE_THAN_ONE_TUPLE);
+	}
+	if (part_count != index->key_def->part_count) {
+		tnt_raise(ClientError, ER_EXACT_MATCH,
+			index->key_def->part_count, part_count);
+	}
 	vinyl_coget(tx, index->db, key, part_count, &old_full_tuple);
 	if (old_full_tuple == NULL) {
 		return NULL;
