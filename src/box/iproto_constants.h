@@ -32,6 +32,7 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
+#include <trivia/util.h>
 
 #include <msgpuck.h>
 
@@ -125,11 +126,12 @@ enum iproto_type {
 	IPROTO_REPLACE = 3,
 	IPROTO_UPDATE = 4,
 	IPROTO_DELETE = 5,
-	IPROTO_CALL = 6,
+	IPROTO_CALL_16 = 6,
 	IPROTO_AUTH = 7,
 	IPROTO_EVAL = 8,
 	IPROTO_UPSERT = 9,
-	IPROTO_TYPE_STAT_MAX = IPROTO_UPSERT + 1,
+	IPROTO_CALL = 10,
+	IPROTO_TYPE_STAT_MAX = IPROTO_CALL + 1,
 	/* admin command codes */
 	IPROTO_PING = 64,
 	IPROTO_JOIN = 65,
@@ -196,6 +198,15 @@ iproto_type_is_error(uint32_t type)
 {
 	return (type & IPROTO_TYPE_ERROR) != 0;
 }
+
+/** The snapshot row metadata repeats the structure of REPLACE request. */
+struct PACKED request_replace_body {
+	uint8_t m_body;
+	uint8_t k_space_id;
+	uint8_t m_space_id;
+	uint32_t v_space_id;
+	uint8_t k_tuple;
+};
 
 #if defined(__cplusplus)
 } /* extern "C" */

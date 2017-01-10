@@ -3,6 +3,7 @@ space = box.schema.space.create('tweedledum')
 index = space:create_index('primary', { type = 'hash' })
 env = require('test_run')
 test_run = env.new()
+
 -- A test case for a race condition between ev_schedule
 -- and wal_schedule fiber schedulers.
 -- The same fiber should not be scheduled by ev_schedule (e.g.
@@ -156,8 +157,10 @@ result
 -- was created
 f = fiber.create(function () fiber.sleep(1) return true end)
 box.snapshot()
-box.snapshot()
-box.snapshot()
+_, e = pcall(box.snapshot)
+e.message:match('already exists')
+_, e = pcall(box.snapshot)
+e.message:match('already exists')
 f = fiber.create(function () fiber.sleep(1) end)
 -- Test fiber.sleep()
 fiber.sleep(0)
@@ -197,6 +200,7 @@ fiber.status(nil)
 function r() fiber.sleep(1000) end
 f = fiber.create(r)
 fiber.cancel(f)
+while f:status() ~= 'dead' do fiber.sleep(0) end
 f:status()
 --  Test fiber.name()
 old_name = fiber.name()
@@ -220,6 +224,7 @@ f = fiber.create(testfun)
 f:cancel()
 fib_id = fiber.create(testfun):id()
 fiber.find(fib_id):cancel()
+while fiber.find(fib_id) ~= nil do fiber.sleep(0) end
 fiber.find(fib_id)
 
 --
@@ -349,10 +354,21 @@ test_run:grep_log("default", "gh%-1238") ~= nil
 
 -- must NOT show in the log
 _ = fiber.create(function() fiber.self():cancel() end)
+fiber.sleep(0.001)
 test_run:grep_log("default", "FiberIsCancelled") == nil
 
 -- must show in the log
 _ = fiber.create(function() box.error(box.error.ILLEGAL_PARAMS, 'oh my') end)
 test_run:grep_log("default", "ER_ILLEGAL_PARAMS:[^\n]*")
 
+-- #1734 fiber.name irt dead fibers
+fiber.create(function()end):name()
+
+--
+-- gh-1926
+--
+fiber.create(function() fiber.wakeup(fiber.self()) end)
+
 fiber = nil
+
+test_run:cmd("clear filter")

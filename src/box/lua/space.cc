@@ -55,12 +55,12 @@ lbox_push_on_replace_event(struct lua_State *L, void *event)
 	struct txn_stmt *stmt = txn_current_stmt((struct txn *) event);
 
 	if (stmt->old_tuple) {
-		lbox_pushtuple(L, stmt->old_tuple);
+		luaT_pushtuple(L, stmt->old_tuple);
 	} else {
 		lua_pushnil(L);
 	}
 	if (stmt->new_tuple) {
-		lbox_pushtuple(L, stmt->new_tuple);
+		luaT_pushtuple(L, stmt->new_tuple);
 	} else {
 		lua_pushnil(L);
 	}
@@ -102,7 +102,7 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 {
 	/* space.arity */
 	lua_pushstring(L, "field_count");
-	lua_pushnumber(L, space->def.field_count);
+	lua_pushnumber(L, space->def.exact_field_count);
 	lua_settable(L, i);
 
 	/* space.n */

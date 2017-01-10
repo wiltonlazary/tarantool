@@ -640,23 +640,11 @@ coio_service_init(struct coio_service *service, const char *name,
 	service->handler_param = handler_param;
 }
 
-static void
-on_bind(void *arg)
-{
-	fiber_wakeup((struct fiber *) arg);
-}
-
 void
 coio_service_start(struct evio_service *service, const char *uri)
 {
-	assert(service->on_bind == NULL);
-	assert(service->on_bind_param == NULL);
-	service->on_bind = on_bind;
-	service->on_bind_param = fiber();
-	evio_service_start(service, uri);
-	fiber_yield();
-	service->on_bind_param = NULL;
-	service->on_bind = NULL;
+	evio_service_bind(service, uri);
+	evio_service_listen(service);
 }
 
 void
@@ -730,7 +718,6 @@ coio_wait(int fd, int events, double timeout)
 	if (fiber_is_cancelled())
 		return 0;
 	struct ev_io io;
-	coio_init(&io, fd);
 	ev_io_init(&io, coio_wait_cb, fd, events);
 	struct coio_wdata wdata = {
 		/* .fiber =   */ fiber(),
@@ -745,5 +732,11 @@ coio_wait(int fd, int events, double timeout)
 	fiber_yield_timeout(timeout);
 
 	ev_io_stop(loop(), &io);
-	return wdata.revents;
+	return wdata.revents & (EV_READ | EV_WRITE);
+}
+
+int coio_close(int fd)
+{
+	ev_io_closing(loop(), fd, EV_CUSTOM);
+	return close(fd);
 }

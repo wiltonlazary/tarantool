@@ -65,7 +65,7 @@ mh_hash_field(uint32_t *ph1, uint32_t *pcarry, const char **field,
 	uint32_t size;
 
 	switch (type) {
-	case STRING:
+	case FIELD_TYPE_STRING:
 		/*
 		 * (!) MP_STR fields hashed **excluding** MsgPack format
 		 * indentifier. We have to do that to keep compatibility
@@ -100,7 +100,7 @@ tuple_hash(struct tuple *tuple, const struct key_def *key_def)
 	 * Speed up the simplest case when we have a
 	 * single-part hash_table over an integer field.
 	 */
-	if (key_def->part_count == 1 && part->type == NUM) {
+	if (key_def->part_count == 1 && part->type == FIELD_TYPE_UNSIGNED) {
 		const char *field = tuple_field(tuple, part->fieldno);
 		uint64_t val = mp_decode_uint(&field);
 		if (likely(val <= UINT32_MAX))
@@ -125,7 +125,7 @@ key_hash(const char *key, const struct key_def *key_def)
 {
 	const struct key_part *part = key_def->parts;
 
-	if (key_def->part_count == 1 && part->type == NUM) {
+	if (key_def->part_count == 1 && part->type == FIELD_TYPE_UNSIGNED) {
 		uint64_t val = mp_decode_uint(&key);
 		if (likely(val <= UINT32_MAX))
 			return val;
@@ -158,7 +158,7 @@ typedef uint32_t hash_t;
 struct hash_iterator {
 	struct iterator base; /* Must be the first member. */
 	struct light_index_core *hash_table;
-	struct light_index_iterator hitr;
+	struct light_index_iterator iterator;
 };
 
 void
@@ -173,8 +173,8 @@ hash_iterator_ge(struct iterator *ptr)
 {
 	assert(ptr->free == hash_iterator_free);
 	struct hash_iterator *it = (struct hash_iterator *) ptr;
-	struct tuple **res = light_index_itr_get_and_next(it->hash_table,
-							  &it->hitr);
+	struct tuple **res = light_index_iterator_get_and_next(it->hash_table,
+							       &it->iterator);
 	return res ? *res : 0;
 }
 
@@ -184,17 +184,17 @@ hash_iterator_gt(struct iterator *ptr)
 	assert(ptr->free == hash_iterator_free);
 	ptr->next = hash_iterator_ge;
 	struct hash_iterator *it = (struct hash_iterator *) ptr;
-	struct tuple **res = light_index_itr_get_and_next(it->hash_table,
-							  &it->hitr);
+	struct tuple **res = light_index_iterator_get_and_next(it->hash_table,
+							       &it->iterator);
 	if (!res)
 		return 0;
-	res = light_index_itr_get_and_next(it->hash_table,
-							  &it->hitr);
+	res = light_index_iterator_get_and_next(it->hash_table,
+						&it->iterator);
 	return res ? *res : 0;
 }
 
 static struct tuple *
-hash_iterator_eq_next(struct iterator *it __attribute__((unused)))
+hash_iterator_eq_next(MAYBE_UNUSED struct iterator *it)
 {
 	return NULL;
 }
@@ -210,8 +210,8 @@ hash_iterator_eq(struct iterator *it)
 
 /* {{{ MemtxHash -- implementation of all hashes. **********************/
 
-MemtxHash::MemtxHash(struct key_def *key_def)
-	: MemtxIndex(key_def)
+MemtxHash::MemtxHash(struct key_def *key_def_arg)
+	: MemtxIndex(key_def_arg)
 {
 	memtx_index_arena_init();
 	hash_table = (struct light_index_core *) malloc(sizeof(*hash_table));
@@ -221,7 +221,7 @@ MemtxHash::MemtxHash(struct key_def *key_def)
 	}
 	light_index_create(hash_table, HASH_INDEX_EXTENT_SIZE,
 			   memtx_index_extent_alloc, memtx_index_extent_free,
-			   this->key_def);
+			   NULL, this->key_def);
 }
 
 MemtxHash::~MemtxHash()
@@ -339,7 +339,7 @@ MemtxHash::allocIterator() const
 	it->base.next = hash_iterator_ge;
 	it->base.free = hash_iterator_free;
 	it->hash_table = hash_table;
-	light_index_itr_begin(it->hash_table, &it->hitr);
+	light_index_iterator_begin(it->hash_table, &it->iterator);
 	return (struct iterator *) it;
 }
 
@@ -356,22 +356,22 @@ MemtxHash::initIterator(struct iterator *ptr, enum iterator_type type,
 	switch (type) {
 	case ITER_GT:
 		if (part_count != 0) {
-			light_index_itr_key(it->hash_table, &it->hitr,
+			light_index_iterator_key(it->hash_table, &it->iterator,
 					    key_hash(key, key_def), key);
 			it->base.next = hash_iterator_gt;
 		} else {
-			light_index_itr_begin(it->hash_table, &it->hitr);
+			light_index_iterator_begin(it->hash_table, &it->iterator);
 			it->base.next = hash_iterator_ge;
 		}
 		break;
 	case ITER_ALL:
-		light_index_itr_begin(it->hash_table, &it->hitr);
+		light_index_iterator_begin(it->hash_table, &it->iterator);
 		it->base.next = hash_iterator_ge;
 		break;
 	case ITER_EQ:
 		assert(part_count > 0);
-		light_index_itr_key(it->hash_table, &it->hitr,
-				    key_hash(key, key_def), key);
+		light_index_iterator_key(it->hash_table, &it->iterator,
+				         key_hash(key, key_def), key);
 		it->base.next = hash_iterator_eq;
 		break;
 	default:
@@ -387,7 +387,7 @@ void
 MemtxHash::createReadViewForIterator(struct iterator *iterator)
 {
 	struct hash_iterator *it = (struct hash_iterator *) iterator;
-	light_index_itr_freeze(it->hash_table, &it->hitr);
+	light_index_iterator_freeze(it->hash_table, &it->iterator);
 }
 
 /**
@@ -398,7 +398,7 @@ void
 MemtxHash::destroyReadViewForIterator(struct iterator *iterator)
 {
 	struct hash_iterator *it = (struct hash_iterator *) iterator;
-	light_index_itr_destroy(it->hash_table, &it->hitr);
+	light_index_iterator_destroy(it->hash_table, &it->iterator);
 }
 
 /* }}} */

@@ -43,7 +43,7 @@
 /* {{{ Utilities. *************************************************/
 
 static inline double
-mp_decode_num(const char **data, uint32_t field_no)
+mp_decode_num(const char **data, uint32_t fieldno)
 {
 	double val;
 	switch (mp_typeof(**data)) {
@@ -60,8 +60,9 @@ mp_decode_num(const char **data, uint32_t field_no)
 		val = mp_decode_double(data);
 		break;
 	default:
-		tnt_raise(ClientError, ER_FIELD_TYPE, field_no + INDEX_OFFSET,
-			  field_type_strs[NUM]);
+		tnt_raise(ClientError, ER_FIELD_TYPE,
+			  fieldno + TUPLE_INDEX_BASE,
+			  field_type_strs[FIELD_TYPE_NUMBER]);
 	}
 	return val;
 }
@@ -174,11 +175,11 @@ MemtxRTree::~MemtxRTree()
 	rtree_destroy(&m_tree);
 }
 
-MemtxRTree::MemtxRTree(struct key_def *key_def)
-	: MemtxIndex(key_def)
+MemtxRTree::MemtxRTree(struct key_def *key_def_arg)
+	: MemtxIndex(key_def_arg)
 {
 	assert(key_def->part_count == 1);
-	assert(key_def->parts[0].type = ARRAY);
+	assert(key_def->parts[0].type = FIELD_TYPE_ARRAY);
 	assert(key_def->opts.is_unique == false);
 
 	m_dimension = key_def->opts.dimension;
@@ -195,7 +196,7 @@ MemtxRTree::MemtxRTree(struct key_def *key_def)
 	enum rtree_distance_type distance_type =
 		(enum rtree_distance_type)(int)key_def->opts.distance;
 	rtree_init(&m_tree, m_dimension, MEMTX_EXTENT_SIZE,
-		   memtx_index_extent_alloc, memtx_index_extent_free,
+		   memtx_index_extent_alloc, memtx_index_extent_free, NULL,
 		   distance_type);
 }
 

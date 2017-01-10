@@ -66,30 +66,48 @@ extern const char *applier_state_strs[];
  * State of a replication connection to the master
  */
 struct applier {
+	/** Background fiber */
 	struct fiber *reader;
+	/** Finite-state machine */
 	enum applier_state state;
-	ev_tstamp lag, last_row_time;
-	bool warning_said;
-	uint32_t id;
-	struct tt_uuid uuid;
-	char source[APPLIER_SOURCE_MAXLEN];
-	struct uri uri;
-	uint32_t version_id; /* remote version */
+	/** Local time of this server when the last row has been received */
+	ev_tstamp last_row_time;
+	/** Number of seconds this server is behind the remote master */
+	ev_tstamp lag;
+	/** The last known vclock of the remote master */
 	struct vclock vclock;
+	/** The last box_error_code() logged to avoid log flooding */
+	uint32_t last_logged_errcode;
+	/** Remote server_id */
+	uint32_t id;
+	/** Remote UUID */
+	struct tt_uuid uuid;
+	/** Remote URI (string) */
+	char source[APPLIER_SOURCE_MAXLEN];
+	/** Remote URI (parsed) */
+	struct uri uri;
+	/** Remote version encoded as a number, see version_id() macro */
+	uint32_t version_id;
+	/** Remote address */
 	union {
 		struct sockaddr addr;
 		struct sockaddr_storage addrstorage;
 	};
+	/** Length of addr */
 	socklen_t addr_len;
+	/** EV watcher for I/O */
 	struct ev_io io;
 	/** Input/output buffer for buffered IO */
 	struct iobuf *iobuf;
 	/** Triggers invoked on state change */
 	struct rlist on_state;
-	/* Channel used by applier_connect_all() and applier_resume() */
+	/** Channel used by applier_connect_all() and applier_resume() */
 	struct ipc_channel pause;
+	/** xstream to process rows during initial JOIN */
 	struct xstream *initial_join_stream;
+	/** xstream to process rows during final JOIN */
 	struct xstream *final_join_stream;
+	/** xstream to process rows during SUBSCRIBE */
 	struct xstream *subscribe_stream;
 };
 
@@ -136,9 +154,15 @@ applier_delete(struct applier *applier);
  * Connect all appliers to remote peer and receive UUID
  * \post appliers are connected to remote hosts and paused.
  * Use applier_resume(applier) to resume applier.
+ *
+ * \param appliers the array of appliers
+ * \param count size of appliers array
+ * \param timeout connection timeout
+ *
  */
 void
-applier_connect_all(struct applier **appliers, int count);
+applier_connect_all(struct applier **appliers, int count,
+		    double timeout);
 
 /*
  * Resume execution of applier until \a state.

@@ -35,178 +35,259 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include <small/region.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct vinyl_env;
-struct vinyl_tx;
-struct vinyl_cursor;
-struct vinyl_index;
+struct vy_env;
+struct vy_tx;
+struct vy_cursor;
+struct vy_index;
 struct key_def;
 struct tuple;
 struct tuple_format;
-struct region;
+struct vclock;
+struct request;
+struct space;
+struct txn_stmt;
+enum iterator_type;
 
 /*
  * Environment
  */
 
-struct vinyl_env *
-vinyl_env_new(void);
+struct vy_env *
+vy_env_new(void);
 
-int
-vinyl_env_delete(struct vinyl_env *e);
+void
+vy_env_delete(struct vy_env *e);
 
 /*
  * Recovery
  */
 
 void
-vinyl_bootstrap(struct vinyl_env *e);
+vy_bootstrap(struct vy_env *e);
 
 void
-vinyl_begin_initial_recovery(struct vinyl_env *e);
+vy_begin_initial_recovery(struct vy_env *e, struct vclock *vclock);
 
 void
-vinyl_begin_final_recovery(struct vinyl_env *e);
+vy_begin_final_recovery(struct vy_env *e);
 
 void
-vinyl_end_recovery(struct vinyl_env *e);
+vy_end_recovery(struct vy_env *e);
 
 int
-vinyl_checkpoint(struct vinyl_env *env);
+vy_checkpoint(struct vy_env *env);
 
-bool
-vinyl_checkpoint_is_active(struct vinyl_env *env);
+int
+vy_wait_checkpoint(struct vy_env *env, struct vclock *vlock);
 
 /*
  * Introspection
  */
 
-enum vy_type {
-	VINYL_NODE = 0,
-	VINYL_STRING,
-	VINYL_U32,
-	VINYL_U64,
+enum vy_info_type {
+	VY_INFO_TABLE_BEGIN,
+	VY_INFO_TABLE_END,
+	VY_INFO_STRING,
+	VY_INFO_U32,
+	VY_INFO_U64,
 };
 
 struct vy_info_node {
+	enum vy_info_type type;
 	const char *key;
-	enum vy_type val_type;
 	union {
-		uint64_t u64;
-		uint32_t u32;
 		const char *str;
+		uint32_t u32;
+		uint64_t u64;
 	} value;
-	int childs_cap;
-	int childs_n;
-	struct vy_info_node *childs;
 };
 
-struct vy_info {
-	struct vy_info_node root;
-	struct region allocator;
-	struct vinyl_env *env;
+struct vy_info_handler {
+	void (*fn)(struct vy_info_node *node, void *ctx);
+	void *ctx;
 };
-
-int
-vy_info_create(struct vy_info *info, struct vinyl_env *e);
 
 void
-vy_info_destroy(struct vy_info *creator);
+vy_info_gather(struct vy_env *env, struct vy_info_handler *h);
 
 /*
  * Transaction
  */
 
-struct vinyl_tx *
-vinyl_begin(struct vinyl_env *e);
+struct vy_tx *
+vy_begin(struct vy_env *e);
+
+/**
+ * Get a tuple from the vinyl index.
+ * @param tx          Current transaction.
+ * @param index       Vinyl index.
+ * @param key         MessagePack'ed data, the array without a
+ *                    header.
+ * @param part_count  Part count of the key
+ * @param[out] result Is set to the the found tuple.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory or read error.
+ */
+int
+vy_get(struct vy_tx *tx, struct vy_index *index,
+       const char *key, uint32_t part_count, struct tuple **result);
+
+/**
+ * Execute REPLACE in a vinyl space.
+ * @param tx      Current transaction.
+ * @param stmt    Statement for triggers filled with old
+ *                statement.
+ * @param space   Vinyl space.
+ * @param request Request with the tuple data.
+ *
+ * @retval  0 Success
+ * @retval -1 Memory error OR duplicate key error OR the primary
+ *            index is not found OR a tuple reference increment
+ *            error.
+ */
+int
+vy_replace(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
+	   struct request *request);
+
+/**
+ * Execute DELETE in a vinyl space.
+ * @param tx      Current transaction.
+ * @param stmt    Statement for triggers filled with deleted
+ *                statement.
+ * @param space   Vinyl space.
+ * @param request Request with the tuple data.
+ *
+ * @retval  0 Success
+ * @retval -1 Memory error OR the index is not found OR a tuple
+ *            reference increment error.
+ */
+int
+vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
+	  struct request *request);
+
+/**
+ * Execute UPDATE in a vinyl space.
+ * @param tx      Current transaction.
+ * @param stmt    Statement for triggers filled with old and new
+ *                statements.
+ * @param space   Vinyl space.
+ * @param request Request with the tuple data.
+ *
+ * @retval  0 Success
+ * @retval -1 Memory error OR the index is not found OR a tuple
+ *            reference increment error.
+ */
+int
+vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
+	  struct request *request);
+
+/**
+ * Execute INSERT in a vinyl space.
+ * @param tx      Current transaction.
+ * @param space   Vinyl space.
+ * @param request Request with the tuple data and update
+ *                operations.
+ *
+ * @retval  0 Success
+ * @retval -1 Memory error OR duplicate error OR the primary
+ *            index is not found
+ */
+int
+vy_insert(struct vy_tx *tx, struct space *space, struct request *request);
+
+/**
+ * Execute UPSERT in a vinyl space.
+ * @param tx      Current transaction.
+ * @param stmt    Statement for triggers filled with old and new
+ *                statements.
+ * @param space   Vinyl space.
+ * @param request Request with the tuple data and update
+ *                operations.
+ *
+ * @retval  0 Success
+ * @retval -1 Memory error OR the index is not found OR a tuple
+ *            reference increment error.
+ */
+int
+vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
+	  struct request *request);
 
 int
-vinyl_coget(struct vinyl_tx *tx, struct vinyl_index *index,
-	    const char *key, uint32_t part_count, struct tuple **result);
+vy_prepare(struct vy_env *e, struct vy_tx *tx);
 
 int
-vinyl_replace(struct vinyl_tx *tx, struct vinyl_index *index,
-	      const char *tuple, const char *tuple_end);
+vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn);
 
-int
-vinyl_upsert(struct vinyl_tx *tx, struct vinyl_index *index,
-	    const char *tuple, const char *tuple_end,
-	    const char *ops, const char *ops_end, int index_base);
+void
+vy_rollback(struct vy_env *e, struct vy_tx *tx);
 
-int
-vinyl_delete(struct vinyl_tx *tx, struct vinyl_index *index,
-	     const char *key, uint32_t part_count);
+void *
+vy_savepoint(struct vy_tx *tx);
 
-int
-vinyl_prepare(struct vinyl_env *e, struct vinyl_tx *tx);
-
-int
-vinyl_commit(struct vinyl_env *e, struct vinyl_tx *tx, int64_t lsn);
-
-int
-vinyl_rollback(struct vinyl_env *e, struct vinyl_tx *tx);
+void
+vy_rollback_to_savepoint(struct vy_tx *tx, void *svp);
 
 /*
  * Index
  */
 
-struct vinyl_index *
-vinyl_index_by_name(struct vinyl_env *env, const char *name);
-
-struct vinyl_index *
-vinyl_index_new(struct vinyl_env *env, struct key_def *key_def,
-		struct tuple_format *tuple_format);
-
-void
-vinyl_index_ref(struct vinyl_index *index);
-
-int
-vinyl_index_unref(struct vinyl_index *index);
-
-int
-vinyl_index_open(struct vinyl_index *index);
+/**
+ * Create a new vinyl index object without opening it.
+ * @param e                    Vinyl environment.
+ * @param user_key_def         Key definition declared by an user
+ *                             with space:create_index().
+ * @param space                Space for which the new index
+ *                             belongs.
+ */
+struct vy_index *
+vy_index_new(struct vy_env *e, struct key_def *user_key_def,
+	     struct space *space);
 
 /**
- * Close index during database shutdown
+ * Hook on an alter space commit event. It is called on each
+ * create_index(), drop_index() and is used for update
+ * vy_index.space attribute.
+ * @param old_space Old space.
+ * @param new_space New space.
  */
+void
+vy_commit_alter_space(struct space *old_space, struct space *new_space);
+
 int
-vinyl_index_close(struct vinyl_index *index);
+vy_index_open(struct vy_index *index);
 
 /**
  * Close index and drop all data
  */
 int
-vinyl_index_drop(struct vinyl_index *index);
+vy_index_drop(struct vy_index *index);
 
 size_t
-vinyl_index_bsize(struct vinyl_index *db);
+vy_index_bsize(struct vy_index *db);
 
 /*
  * Index Cursor
  */
 
-enum vinyl_order {
-	VINYL_LT,
-	VINYL_LE,
-	VINYL_GT,
-	VINYL_GE,
-	VINYL_EQ
-};
-
-struct vinyl_cursor *
-vinyl_cursor_new(struct vinyl_index *index, const char *key,
-		 uint32_t part_count, enum vinyl_order order);
+/**
+ * Create a cursor. If tx is not NULL, the cursor life time is
+ * bound by the transaction life time. Otherwise, the cursor
+ * allocates its own transaction.
+ */
+struct vy_cursor *
+vy_cursor_new(struct vy_tx *tx, struct vy_index *index, const char *key,
+	      uint32_t part_count, enum iterator_type type);
 
 void
-vinyl_cursor_delete(struct vinyl_cursor *cursor);
+vy_cursor_delete(struct vy_cursor *cursor);
 
 int
-vinyl_cursor_conext(struct vinyl_cursor *cursor, struct tuple **result);
+vy_cursor_next(struct vy_cursor *cursor, struct tuple **result);
 
 /*
  * Replication
@@ -215,7 +296,7 @@ vinyl_cursor_conext(struct vinyl_cursor *cursor, struct tuple **result);
 typedef int
 (*vy_send_row_f)(void *, const char *tuple, uint32_t tuple_size, int64_t lsn);
 int
-vy_index_send(struct vinyl_index *index, vy_send_row_f sendrow, void *ctx);
+vy_index_send(struct vy_index *index, vy_send_row_f sendrow, void *ctx);
 
 #ifdef __cplusplus
 }

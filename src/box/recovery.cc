@@ -164,16 +164,15 @@ recovery_new(const char *wal_dirname, bool panic_on_wal_error,
 static inline void
 recovery_close_log(struct recovery *r)
 {
-	if (r->current_wal == NULL)
+	if (r->cursor.state == XLOG_CURSOR_CLOSED)
 		return;
-	if (r->current_wal->eof_read) {
-		say_info("done `%s'", r->current_wal->filename);
+	if (r->cursor.state == XLOG_CURSOR_EOF) {
+		say_info("done `%s'", r->cursor.name);
 	} else {
 		say_warn("file `%s` wasn't correctly closed",
-			 r->current_wal->filename);
+			 r->cursor.name);
 	}
-	xlog_close(r->current_wal);
-	r->current_wal = NULL;
+	xlog_cursor_close(&r->cursor, false);
 }
 
 void
@@ -182,12 +181,12 @@ recovery_delete(struct recovery *r)
 	recovery_stop_local(r);
 
 	xdir_destroy(&r->wal_dir);
-	if (r->current_wal) {
+	if (r->cursor.state != XLOG_CURSOR_CLOSED) {
 		/*
 		 * Possible if shutting down a replication
 		 * relay or if error during startup.
 		 */
-		xlog_close(r->current_wal);
+		xlog_cursor_close(&r->cursor, false);
 	}
 	free(r);
 }
@@ -208,39 +207,39 @@ recovery_exit(struct recovery *r)
  * Use NULL for boundless recover
  */
 static void
-recover_xlog(struct recovery *r, struct xstream *stream, struct xlog *l,
+recover_xlog(struct recovery *r, struct xstream *stream,
 	     struct vclock *stop_vclock)
 {
-	struct xlog_cursor i;
-
-	xlog_cursor_open(&i, l);
-
-	auto guard = make_scoped_guard([&]{
-		xlog_cursor_close(&i);
-	});
-
 	struct xrow_header row;
-	/*
-	 * xlog_cursor_next() returns 1 when
-	 * it can not read more rows. This doesn't mean
-	 * the file is fully read: it's fully read only
-	 * when EOF marker has been read, see i.eof_read
-	 */
-	while (xlog_cursor_next_xc(&i, &row) == 0) {
+	uint64_t row_count = 0;
+	while (xlog_cursor_next_xc(&r->cursor, &row,
+				   r->wal_dir.panic_if_error) == 0) {
+		/*
+		 * Read the next row from xlog file.
+		 *
+		 * xlog_cursor_next_xc() returns 1 when
+		 * it can not read more rows. This doesn't mean
+		 * the file is fully read: it's fully read only
+		 * when EOF marker has been read, see i.eof_read
+		 */
 		if (stop_vclock != NULL &&
 		    r->vclock.signature >= stop_vclock->signature)
 			return;
+		int64_t current_lsn = vclock_get(&r->vclock, row.server_id);
+		if (row.lsn <= current_lsn)
+			continue; /* already applied, skip */
+
 		try {
-			int64_t current_lsn = vclock_get(&r->vclock,
-							 row.server_id);
-			if (row.lsn <= current_lsn)
-				continue;
 			xstream_write(stream, &row);
+			++row_count;
+			if (row_count % 100000 == 0)
+				say_info("%.1fM rows processed",
+					 row_count / 1000000.);
 		} catch (ClientError *e) {
-			if (l->dir->panic_if_error)
-				throw;
 			say_error("can't apply row: ");
 			e->log();
+			if (r->wal_dir.panic_if_error)
+				throw;
 		}
 	}
 }
@@ -268,9 +267,9 @@ recover_remaining_wals(struct recovery *r, struct xstream *stream,
 	 */
 	struct vclock *last = vclockset_last(&r->wal_dir.index);
 	if (last == NULL) {
-		if (r->current_wal != NULL) {
+		if (r->cursor.state != XLOG_CURSOR_CLOSED) {
 			say_error("file `%s' was deleted under our feet",
-				  r->current_wal->filename);
+				  r->cursor.name);
 			recovery_close_log(r);
 		}
 		/** Nothing to do. */
@@ -280,11 +279,11 @@ recover_remaining_wals(struct recovery *r, struct xstream *stream,
 
 	/* If the caller already opened WAL for us, recover from it first */
 	struct vclock *clock;
-	if (r->current_wal != NULL) {
+	if (r->cursor.state != XLOG_CURSOR_CLOSED) {
 		clock = vclockset_match(&r->wal_dir.index,
-					&r->current_wal->vclock);
+					&r->cursor.meta.vclock);
 		if (clock != NULL &&
-		    vclock_compare(clock, &r->current_wal->vclock) == 0)
+		    vclock_compare(clock, &r->cursor.meta.vclock) == 0)
 			goto recover_current_wal;
 		/*
 		 * The current WAL has disappeared under our feet -
@@ -292,7 +291,7 @@ recover_remaining_wals(struct recovery *r, struct xstream *stream,
 		 * on.
 		 */
 		say_error("file `%s' was deleted under our feet",
-			  r->current_wal->filename);
+			  r->cursor.name);
 	}
 
 	for (clock = vclockset_match(&r->wal_dir.index, &r->vclock);
@@ -320,13 +319,13 @@ recover_remaining_wals(struct recovery *r, struct xstream *stream,
 		}
 		recovery_close_log(r);
 
-		r->current_wal = xlog_open_xc(&r->wal_dir, vclock_sum(clock));
+		xdir_open_cursor_xc(&r->wal_dir, vclock_sum(clock), &r->cursor);
 
-		say_info("recover from `%s'", r->current_wal->filename);
+		say_info("recover from `%s'", r->cursor.name);
 
 recover_current_wal:
-		if (r->current_wal->eof_read == false)
-			recover_xlog(r, stream, r->current_wal, stop_vclock);
+		if (r->cursor.state != XLOG_CURSOR_EOF)
+			recover_xlog(r, stream, stop_vclock);
 		/**
 		 * Keep the last log open to remember recovery
 		 * position. This speeds up recovery in local hot
@@ -495,27 +494,32 @@ recovery_follow_f(va_list ap)
 		 */
 		int64_t start, end;
 		do {
-			start = r->current_wal ? vclock_sum(&r->current_wal->vclock) : 0;
+			start = r->cursor.state != XLOG_CURSOR_CLOSED ?
+				vclock_sum(&r->cursor.meta.vclock) : 0;
 			/*
 			 * If there is no current WAL, or we reached
 			 * an end  of one, look for new WALs.
 			 */
-			if (r->current_wal == NULL || r->current_wal->eof_read)
+			if (r->cursor.state == XLOG_CURSOR_CLOSED
+			    || r->cursor.state == XLOG_CURSOR_EOF)
 				xdir_scan_xc(&r->wal_dir);
 
 			recover_remaining_wals(r, stream, NULL);
 
-			end = r->current_wal ? vclock_sum(&r->current_wal->vclock) : 0;
+			end = r->cursor.state != XLOG_CURSOR_CLOSED ?
+			      vclock_sum(&r->cursor.meta.vclock) : 0;
 			/*
 			 * Continue, given there's been progress *and* there is a
 			 * chance new WALs have appeared since.
 			 * Sic: end * is < start (is 0) if someone deleted all logs
 			 * on the filesystem.
 			 */
-		} while (end > start && (r->current_wal == NULL || r->current_wal->eof_read));
+		} while (end > start &&
+			 (r->cursor.state == XLOG_CURSOR_CLOSED ||
+			  r->cursor.state == XLOG_CURSOR_EOF));
 
-		subscription.set_log_path(r->current_wal != NULL ?
-					  r->current_wal->filename : NULL);
+		subscription.set_log_path(r->cursor.state != XLOG_CURSOR_CLOSED ?
+					  r->cursor.name: NULL);
 
 		if (subscription.signaled == false) {
 			/**
@@ -542,10 +546,10 @@ recovery_follow_local(struct recovery *r, struct xstream *stream,
 	 */
 	xdir_scan_xc(&r->wal_dir);
 	recover_remaining_wals(r, stream, NULL);
-	recovery_close_log(r);
-
 	/*
 	 * Start 'hot_standby' background fiber to follow xlog changes.
+	 * It will pick up from the position of the currently open
+	 * xlog.
 	 */
 	assert(r->watcher == NULL);
 	r->watcher = fiber_new_xc(name, recovery_follow_f);
@@ -560,8 +564,8 @@ recovery_stop_local(struct recovery *r)
 		struct fiber *f = r->watcher;
 		r->watcher = NULL;
 		fiber_cancel(f);
-		fiber_join(f);
-		diag_raise();
+		if (fiber_join(f) != 0)
+			diag_raise();
 	}
 }
 

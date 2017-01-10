@@ -33,10 +33,37 @@
 #include "engine.h"
 #include "xlog.h"
 
+/**
+ * The state of memtx recovery process.
+ * There is a global state of the entire engine state of each
+ * space. The state of a space is initialized from the engine
+ * state when the space is created. The exception is system
+ * spaces, which are always created in the final (OK) state.
+ *
+ * The states exist to speed up recovery: initial state
+ * assumes write-only flow of sorted rows from a snapshot.
+ * It's followed by a state for read-write recovery
+ * of rows from the write ahead log; these rows are
+ * inserted only into the primary key. The final
+ * state is for a fully functional space.
+ */
 enum memtx_recovery_state {
+	/** The space has no indexes. */
 	MEMTX_INITIALIZED,
+	/**
+	 * The space has only the primary index, which is in
+	 * write-only bulk insert mode.
+	 */
 	MEMTX_INITIAL_RECOVERY,
+	/**
+	 * The space has the primary index, which can be
+	 * used for reads and writes, but secondary indexes are
+	 * empty. The will be built at the end of recovery.
+	 */
 	MEMTX_FINAL_RECOVERY,
+	/**
+	 * The space and all its indexes are fully built.
+	 */
 	MEMTX_OK,
 };
 
@@ -48,25 +75,26 @@ struct MemtxEngine: public Engine {
 					      bool panic_on_wal_error);
 	~MemtxEngine();
 	virtual Handler *open() override;
-	virtual Index *createIndex(struct key_def *key_def) override;
 	virtual void addPrimaryKey(struct space *space) override;
-	virtual void dropIndex(Index *index) override;
 	virtual void dropPrimaryKey(struct space *space) override;
-	virtual bool needToBuildSecondaryKey(struct space *space) override;
+	virtual void buildSecondaryKey(struct space *old_space,
+				       struct space *new_space,
+				       Index *new_index) override;
 	virtual void keydefCheck(struct space *space, struct key_def *key_def) override;
 	virtual void begin(struct txn *txn) override;
-	virtual void rollbackStatement(struct txn_stmt *stmt) override;
+	virtual void rollbackStatement(struct txn *,
+				       struct txn_stmt *stmt) override;
 	virtual void rollback(struct txn *txn) override;
 	virtual void prepare(struct txn *txn) override;
 	virtual void commit(struct txn *txn, int64_t signature) override;
 	virtual void bootstrap() override;
-	virtual void beginInitialRecovery() override;
+	virtual void beginInitialRecovery(struct vclock *vclock) override;
 	virtual void beginFinalRecovery() override;
 	virtual void endRecovery() override;
 	virtual void join(struct xstream *stream) override;
 	virtual int beginCheckpoint() override;
 	virtual int waitCheckpoint(struct vclock *vclock) override;
-	virtual void commitCheckpoint() override;
+	virtual void commitCheckpoint(struct vclock *vclock) override;
 	virtual void abortCheckpoint() override;
 	virtual void initSystemSpace(struct space *space) override;
 	/* Update snap_io_rate_limit. */
@@ -81,6 +109,7 @@ struct MemtxEngine: public Engine {
 	 * no snapshot.
 	 */
 	int64_t lastCheckpoint(struct vclock *vclock);
+	void recoverSnapshot();
 private:
 	void
 	recoverSnapshotRow(struct xrow_header *row);
@@ -114,13 +143,13 @@ memtx_index_arena_init();
  * Allocate a block of size MEMTX_EXTENT_SIZE for memtx index
  */
 void *
-memtx_index_extent_alloc();
+memtx_index_extent_alloc(void *ctx);
 
 /**
  * Free a block previously allocated by memtx_index_extent_alloc
  */
 void
-memtx_index_extent_free(void *extent);
+memtx_index_extent_free(void *ctx, void *extent);
 
 /**
  * Reserve num extents in pool.

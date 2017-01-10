@@ -43,17 +43,20 @@
 #include "xrow.h"
 #include "tuple.h"
 #include "txn.h"
-#include "index.h"
 #include "relay.h"
 #include "space.h"
 #include "schema.h"
-#include "port.h"
-#include "request.h"
 #include "iproto_constants.h"
 #include "vinyl.h"
+#include "vy_stmt.h"
+
+struct tuple_format_vtab vy_tuple_format_vtab = {
+	vy_tuple_new,
+	vy_tuple_delete,
+};
 
 /* Used by lua/info.c */
-extern "C" struct vinyl_env *
+extern "C" struct vy_env *
 vinyl_engine_get_env()
 {
 	VinylEngine *e = (VinylEngine *)engine_find("vinyl");
@@ -61,8 +64,8 @@ vinyl_engine_get_env()
 }
 
 VinylEngine::VinylEngine()
-	:Engine("vinyl")
-	 ,recovery_complete(0)
+	:Engine("vinyl", &vy_tuple_format_vtab)
+	,recovery_complete(false)
 {
 	flags = 0;
 	env = NULL;
@@ -71,13 +74,13 @@ VinylEngine::VinylEngine()
 VinylEngine::~VinylEngine()
 {
 	if (env)
-		vinyl_env_delete(env);
+		vy_env_delete(env);
 }
 
 void
 VinylEngine::init()
 {
-	env = vinyl_env_new();
+	env = vy_env_new();
 	if (env == NULL)
 		panic("failed to create vinyl environment");
 }
@@ -85,20 +88,20 @@ VinylEngine::init()
 void
 VinylEngine::bootstrap()
 {
-	vinyl_bootstrap(env);
-	recovery_complete = 1;
+	vy_bootstrap(env);
+	recovery_complete = true;
 }
 
 void
-VinylEngine::beginInitialRecovery()
+VinylEngine::beginInitialRecovery(struct vclock *vclock)
 {
-	vinyl_begin_initial_recovery(env);
+	vy_begin_initial_recovery(env, vclock);
 }
 
 void
 VinylEngine::beginFinalRecovery()
 {
-	vinyl_begin_final_recovery(env);
+	vy_begin_final_recovery(env);
 }
 
 void
@@ -106,14 +109,53 @@ VinylEngine::endRecovery()
 {
 	assert(!recovery_complete);
 	/* complete two-phase recovery */
-	vinyl_end_recovery(env);
-	recovery_complete = 1;
+	vy_end_recovery(env);
+	recovery_complete = true;
 }
 
 Handler *
 VinylEngine::open()
 {
 	return new VinylSpace(this);
+}
+
+void
+VinylEngine::addPrimaryKey(struct space *space)
+{
+	VinylIndex *pk = (VinylIndex *) index_find_xc(space, 0);
+	pk->open();
+}
+
+void
+VinylEngine::buildSecondaryKey(struct space *old_space,
+			       struct space *new_space,
+			       Index *new_index_arg)
+{
+	(void)old_space;
+	(void)new_space;
+	VinylIndex *new_index = (VinylIndex *) new_index_arg;
+	new_index->open();
+	/* Unlike Memtx, Vinyl does not need building of a secondary index.
+	 * This is true because of two things:
+	 * 1) Vinyl does not support alter of non-empty spaces
+	 * 2) During recovery a Vinyl index already has all needed data on disk.
+	 * And there are 3 cases:
+	 * I. The secondary index is added in snapshot. Then Vinyl was
+	 * snapshotted too and all necessary for that moment data is on disk.
+	 * II. The secondary index is added in WAL. That means that vinyl
+	 * space had no data at that point and had nothing to build. The
+	 * index actually could contain recovered data, but it will handle it
+	 * by itself during WAL recovery.
+	 * III. Vinyl is online. The space is definitely empty and there's
+	 * nothing to build.
+	 *
+	 * When we start to implement alter of non-empty vinyl spaces, it
+	 *  seems that we should call here:
+	 *   Engine::buildSecondaryKey(old_space, new_space, new_index_arg);
+	 *  but aware of three cases mentioned above.
+	 */
+	assert(!recovery_complete ||
+	       index_find_xc(old_space, 0)->min(NULL, 0) == NULL);
 }
 
 struct vinyl_send_row_arg {
@@ -128,12 +170,14 @@ vinyl_send_row(void *arg, const char *tuple, uint32_t tuple_size, int64_t lsn)
 	uint32_t space_id = ((struct vinyl_send_row_arg *) arg)->space_id;
 
 	struct request_replace_body body;
+	memset(&body, 0, sizeof(body));
 	body.m_body = 0x82; /* map of two elements. */
 	body.k_space_id = IPROTO_SPACE_ID;
 	body.m_space_id = 0xce; /* uint32 */
 	body.v_space_id = mp_bswap_u32(space_id);
 	body.k_tuple = IPROTO_TUPLE;
 	struct xrow_header row;
+	memset(&row, 0, sizeof(row));
 	row.type = IPROTO_INSERT;
 	row.server_id = 0;
 	row.lsn = lsn;
@@ -151,7 +195,7 @@ vinyl_send_row(void *arg, const char *tuple, uint32_t tuple_size, int64_t lsn)
 }
 
 struct join_send_space_arg {
-	struct vinyl_env *env;
+	struct vy_env *env;
 	struct xstream *stream;
 };
 
@@ -184,29 +228,6 @@ VinylEngine::join(struct xstream *stream)
 	space_foreach(join_send_space, &arg);
 }
 
-Index*
-VinylEngine::createIndex(struct key_def *key_def)
-{
-	switch (key_def->type) {
-	case TREE: return new VinylIndex(key_def);
-	default:
-		unreachable();
-		return NULL;
-	}
-}
-
-void
-VinylEngine::dropIndex(Index *index)
-{
-	VinylIndex *i = (VinylIndex *)index;
-	/* schedule asynchronous drop */
-	int rc = vinyl_index_drop(i->db);
-	if (rc == -1)
-		diag_raise();
-	i->db  = NULL;
-	i->env = NULL;
-}
-
 void
 VinylEngine::keydefCheck(struct space *space, struct key_def *key_def)
 {
@@ -215,51 +236,56 @@ VinylEngine::keydefCheck(struct space *space, struct key_def *key_def)
 		          key_def->name,
 		          space_name(space));
 	}
-	if (! key_def->opts.is_unique) {
-		tnt_raise(ClientError, ER_MODIFY_INDEX,
-			  key_def->name,
-			  space_name(space),
-			  "Vinyl index must be unique");
-	}
-	if (key_def->iid != 0) {
-		tnt_raise(ClientError, ER_MODIFY_INDEX,
-			  key_def->name,
-			  space_name(space),
-			  "Vinyl secondary indexes are not supported");
-	}
 }
 
 void
 VinylEngine::begin(struct txn *txn)
 {
 	assert(txn->engine_tx == NULL);
-	txn->engine_tx = vinyl_begin(env);
+	txn->engine_tx = vy_begin(env);
 	if (txn->engine_tx == NULL)
 		diag_raise();
 }
 
 void
+VinylEngine::beginStatement(struct txn *txn)
+{
+	assert(txn != NULL);
+	struct vy_tx *tx = (struct vy_tx *)(txn->engine_tx);
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+	stmt->engine_savepoint = vy_savepoint(tx);
+}
+
+void
 VinylEngine::prepare(struct txn *txn)
 {
-	struct vinyl_tx *tx = (struct vinyl_tx *) txn->engine_tx;
+	struct vy_tx *tx = (struct vy_tx *) txn->engine_tx;
 
-	int rc = vinyl_prepare(env, tx);
-	switch (rc) {
-	case 1: /* rollback, will be done by all-engines transaction manager */
-		tnt_raise(ClientError, ER_TRANSACTION_CONFLICT);
-		break;
-	case -1:
+	if (vy_prepare(env, tx))
 		diag_raise();
-		break;
-	}
+}
+
+static inline void
+txn_stmt_unref_tuples(struct txn_stmt *stmt)
+{
+	if (stmt->old_tuple)
+		tuple_unref(stmt->old_tuple);
+	if (stmt->new_tuple)
+		tuple_unref(stmt->new_tuple);
+	stmt->old_tuple = NULL;
+	stmt->new_tuple = NULL;
 }
 
 void
 VinylEngine::commit(struct txn *txn, int64_t lsn)
 {
-	struct vinyl_tx *tx = (struct vinyl_tx *) txn->engine_tx;
+	struct vy_tx *tx = (struct vy_tx *) txn->engine_tx;
+	struct txn_stmt *stmt;
+	stailq_foreach_entry(stmt, &txn->stmts, next) {
+		txn_stmt_unref_tuples(stmt);
+	}
 	if (tx) {
-		int rc = vinyl_commit(env, tx, txn->n_rows ? lsn : 0);
+		int rc = vy_commit(env, tx, txn->n_rows ? lsn : 0);
 		if (rc == -1) {
 			panic("vinyl commit failed: txn->signature = %"
 			      PRIu64, lsn);
@@ -274,27 +300,32 @@ VinylEngine::rollback(struct txn *txn)
 	if (txn->engine_tx == NULL)
 		return;
 
-	struct vinyl_tx *tx = (struct vinyl_tx *) txn->engine_tx;
-	vinyl_rollback(env, tx);
+	struct vy_tx *tx = (struct vy_tx *) txn->engine_tx;
+	vy_rollback(env, tx);
 	txn->engine_tx = NULL;
+	struct txn_stmt *stmt;
+	stailq_foreach_entry(stmt, &txn->stmts, next) {
+		txn_stmt_unref_tuples(stmt);
+	}
 }
+
+void
+VinylEngine::rollbackStatement(struct txn *txn, struct txn_stmt *stmt)
+{
+	txn_stmt_unref_tuples(stmt);
+	vy_rollback_to_savepoint((struct vy_tx *)txn->engine_tx,
+				 stmt->engine_savepoint);
+}
+
 
 int
 VinylEngine::beginCheckpoint()
 {
-	int rc = vinyl_checkpoint(env);
-	if (rc == -1)
-		diag_raise();
-	return 0;
+	return vy_checkpoint(env);
 }
 
 int
-VinylEngine::waitCheckpoint(struct vclock*)
+VinylEngine::waitCheckpoint(struct vclock* vclock)
 {
-	for (;;) {
-		if (!vinyl_checkpoint_is_active(env))
-			break;
-		fiber_yield_timeout(.020);
-	}
-	return 0;
+	return vy_wait_checkpoint(env, vclock);
 }

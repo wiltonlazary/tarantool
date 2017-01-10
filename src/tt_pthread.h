@@ -35,6 +35,7 @@
 #include "trivia/util.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <pthread.h>
 #if HAVE_PTHREAD_NP_H
 #include <pthread_np.h>
@@ -46,15 +47,17 @@
  * write into the log file where and what has failed.
  *
  * Still give the user an opportunity to manually
- * check for error, by returning the pthread_* 
- * function status.
+ * check for error, by assigning pthread_* function status
+ * to errno and returning -1.
  */
 
 #define tt_pthread_error(e)			\
-	if (e != 0)				\
+	if (e != 0) {				\
 		say_syserror("%s error %d", __func__, e);\
+		errno = e;			\
+	}					\
 	assert(e == 0);				\
-	e
+	e != 0 ? -1 : 0
 
 /**
  * Debug/logging friendly wrappers around pthread
@@ -133,6 +136,76 @@
 	tt_pthread_error(e__);			\
 })
 
+#define tt_pthread_rwlock_init(rwlock, attr)	\
+({						\
+	int e__ = pthread_rwlock_init(rwlock, attr);\
+	tt_pthread_error(e__);			\
+})
+
+#define tt_pthread_rwlock_destroy(rwlock)		\
+({	int e__ = pthread_rwlock_destroy(rwlock);	\
+	tt_pthread_error(e__);			\
+})
+
+#define tt_pthread_rwlock_rdlock(rwlock)		\
+({	int e__ = pthread_rwlock_rdlock(rwlock);	\
+	say_debug("%s: locking %s", __func__, #rwlock);\
+	tt_pthread_error(e__);\
+})
+
+#define tt_pthread_rwlock_tryrdlock(rwlock)		\
+({	int e__ = pthread_rwlock_tryrdlock(rwlock);	\
+	if (e__ != 0 && e__ != EBUSY)		\
+		say_error("%s error %d at %s:%d", __func__, e__, __FILE__, __LINE__);\
+	assert(e__ == 0 || e__ == EBUSY);	\
+	e__;					\
+})
+
+#define tt_pthread_rwlock_wrlock(rwlock)		\
+({	int e__ = pthread_rwlock_wrlock(rwlock);	\
+	say_debug("%s: locking %s", __func__, #rwlock);\
+	tt_pthread_error(e__);\
+})
+
+#define tt_pthread_rwlock_trywrlock(rwlock)		\
+({	int e__ = pthread_rwlock_trywrlock(rwlock);	\
+	if (e__ != 0 && e__ != EBUSY)		\
+		say_error("%s error %d at %s:%d", __func__, e__, __FILE__, __LINE__);\
+	assert(e__ == 0 || e__ == EBUSY);	\
+	e__;					\
+})
+
+#define tt_pthread_rwlock_unlock(rwlock)		\
+({	int e__ = pthread_rwlock_unlock(rwlock);	\
+	say_debug("%s: unlocking %s", __func__, #rwlock);\
+	tt_pthread_error(e__);			\
+})
+
+#define tt_pthread_rwlock_destroy(rwlock)		\
+({	int e__ = pthread_rwlock_destroy(rwlock);	\
+	tt_pthread_error(e__);			\
+})
+
+#define tt_pthread_rwlockattr_init(attr)		\
+({	int e__ = pthread_rwlockattr_init(attr);	\
+	tt_pthread_error(e__);			\
+})
+
+#define tt_pthread_rwlockattr_destroy(attr)	\
+({	int e__ = pthread_rwlockattr_destroy(attr);\
+	tt_pthread_error(e__);			\
+})
+
+#define tt_pthread_rwlockattr_gettype(attr, type)\
+({	int e__ = pthread_rwlockattr_gettype(attr, type);\
+	tt_pthread_error(e__);			\
+})
+
+#define tt_pthread_rwlockattr_settype(attr, type)\
+({	int e__ = pthread_rwlockattr_settype(attr, type);\
+	tt_pthread_error(e__);			\
+})
+
 #define tt_pthread_condattr_init(attr)		\
 ({	int e__ = pthread_condattr_init(attr);	\
 	tt_pthread_error(e__);			\
@@ -165,7 +238,7 @@
 
 #define tt_pthread_cond_timedwait(cond, mutex, timeout)	\
 ({	int e__ = pthread_cond_timedwait(cond, mutex, timeout);\
-	if (ETIMEDOUT != e__)			\
+	if (ETIMEDOUT != e__ && e__ != 0)		\
 		say_error("%s error %d", __func__, e__);\
 	assert(e__ == 0 || e__ == ETIMEDOUT);	\
 	e__;					\
@@ -197,6 +270,23 @@
 ({	int e__ = pthread_join(thread, ret);		\
 	tt_pthread_error(e__);				\
 })
+
+#define tt_pthread_key_create(key, dtor)		\
+({	int e__ = pthread_key_create(key, dtor);	\
+	tt_pthread_error(e__);				\
+})
+
+#define tt_pthread_key_delete(key)			\
+({	int e__ = pthread_key_delete(key);		\
+	tt_pthread_error(e__);				\
+})
+
+#define tt_pthread_setspecific(key, value)		\
+({	int e__ = pthread_setspecific(key, value);	\
+	tt_pthread_error(e__);				\
+})
+
+#define tt_pthread_getspecific(key) pthread_getspecific(key)
 
 /** Set the current thread's name
  */

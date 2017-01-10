@@ -90,6 +90,7 @@ extern char strict_lua[],
 	help_en_US_lua[],
 	tap_lua[],
 	fio_lua[],
+	argparse_lua[],
 	/* jit.* library */
 	vmdef_lua[],
 	bc_lua[],
@@ -101,6 +102,7 @@ extern char strict_lua[],
 	v_lua[],
 	clock_lua[],
 	title_lua[],
+	env_lua[],
 	p_lua[], /* LuaJIT 2.1 profiler */
 	zone_lua[] /* LuaJIT 2.1 profiler */;
 
@@ -110,6 +112,7 @@ static const char *lua_modules[] = {
 	"tarantool", init_lua,
 	"errno", errno_lua,
 	"fiber", fiber_lua,
+	"env", env_lua,
 	"buffer", buffer_lua,
 	"msgpackffi", msgpackffi_lua,
 	"fun", fun_lua,
@@ -127,6 +130,7 @@ static const char *lua_modules[] = {
 	"tap", tap_lua,
 	"help.en_US", help_en_US_lua,
 	"help", help_lua,
+	"internal.argparse", argparse_lua,
 	/* jit.* library */
 	"jit.vmdef", vmdef_lua,
 	"jit.bc", bc_lua,
@@ -184,14 +188,6 @@ lbox_tonumber64(struct lua_State *L)
 	return 1;
 }
 
-static int
-lbox_coredump(struct lua_State *L __attribute__((unused)))
-{
-	coredump(60);
-	lua_pushstring(L, "ok");
-	return 1;
-}
-
 /* }}} */
 
 /**
@@ -243,12 +239,12 @@ tarantool_lua_setpaths(struct lua_State *L)
 	tarantool_lua_pushpath_env(L, "LUA_PATH");
 	lua_setfield(L, top, "path");
 
-	lua_pushliteral(L, "./?." TARANTOOL_LIBEXT ";");
+	lua_pushliteral(L, "./?" MODULE_LIBSUFFIX ";");
 	if (home != NULL) {
 		lua_pushstring(L, home);
-		lua_pushliteral(L, "/.luarocks/lib/lua/5.1/?." TARANTOOL_LIBEXT ";");
+		lua_pushliteral(L, "/.luarocks/lib/lua/5.1/?" MODULE_LIBSUFFIX ";");
 		lua_pushstring(L, home);
-		lua_pushliteral(L, "/.luarocks/lib/lua/?." TARANTOOL_LIBEXT ";");
+		lua_pushliteral(L, "/.luarocks/lib/lua/?" MODULE_LIBSUFFIX ";");
 	}
 	lua_pushliteral(L, MODULE_LIBPATH ";");
 	/* overwrite standard paths */
@@ -325,7 +321,6 @@ tarantool_lua_init(const char *tarantool_bin, int argc, char **argv)
 	lua_call(L, 0, 0);
 
 	lua_register(L, "tonumber64", lbox_tonumber64);
-	lua_register(L, "coredump", lbox_coredump);
 
 	tarantool_lua_utils_init(L);
 	tarantool_lua_fiber_init(L);
@@ -447,7 +442,7 @@ run_script_f(va_list ap)
 	lua_checkstack(L, argc - 1);
 	for (int i = 1; i < argc; i++)
 		lua_pushstring(L, argv[i]);
-	if (lbox_call(L, lua_gettop(L) - 1, 0) != 0) {
+	if (luaT_call(L, lua_gettop(L) - 1, 0) != 0) {
 		struct error *e = diag_last_error(&fiber()->diag);
 		panic("%s", e->errmsg);
 	}

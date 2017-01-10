@@ -30,21 +30,18 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-
 #include "index.h"
 
-class VinylIndex: public Index {
+/**
+ * C++ wrapper for struct vy_index.
+ */
+struct VinylIndex: public Index
+{
 public:
-	VinylIndex(struct key_def *key_def);
-	virtual ~VinylIndex() override;
+	VinylIndex(struct vy_env *env, struct key_def *key_def);
 
-	virtual struct tuple*
-	replace(struct tuple*,
-	        struct tuple*, enum dup_replace_mode) override;
-
-	/* Used by INSERT */
-	struct tuple *
-	findByKey(struct vinyl_tuple *tuple) const;
+	virtual void
+	open();
 
 	virtual struct tuple*
 	findByKey(const char *key, uint32_t) const override;
@@ -54,27 +51,25 @@ public:
 
 	virtual void
 	initIterator(struct iterator *iterator,
-	             enum iterator_type type,
-	             const char *key, uint32_t part_count) const override;
+		     enum iterator_type type,
+		     const char *key, uint32_t part_count) const override;
 
-	virtual size_t bsize() const override;
+	virtual size_t
+	bsize() const override;
 
-	virtual struct tuple *min(const char *key,
-					uint32_t part_count) const override;
+	virtual struct tuple *
+	min(const char *key, uint32_t part_count) const override;
 
-	virtual struct tuple *max(const char *key,
-				  uint32_t part_count) const override;
+	virtual struct tuple *
+	max(const char *key, uint32_t part_count) const override;
 
-	virtual size_t count(enum iterator_type type, const char *key,
-			     uint32_t part_count) const override;
-
-
+	virtual size_t
+	count(enum iterator_type type, const char *key, uint32_t part_count)
+		const override;
 
 public:
-	struct vinyl_env *env;
-	struct vinyl_index *db;
-private:
-	struct tuple_format *format;
+	struct vy_env *env;
+	struct vy_index *db;
 };
 
 #endif /* TARANTOOL_BOX_VINYL_INDEX_H_INCLUDED */

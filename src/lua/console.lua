@@ -6,10 +6,10 @@ local socket = require('socket')
 local log = require('log')
 local errno = require('errno')
 local urilib = require('uri')
-local ffi = require('ffi')
+local yaml = require('yaml')
 
 -- admin formatter must be able to encode any Lua variable
-local formatter = require('yaml').new()
+local formatter = yaml.new()
 formatter.cfg{
     encode_invalid_numbers = true;
     encode_load_metatables = true;
@@ -48,13 +48,6 @@ local function format(status, ...)
     return formatter.encode({{error = err }})
 end
 
-local function local_format(status, ...)
-    if not status and type(box.cfg) == 'table' then
-        box.rollback()
-    end
-    return format(status, ...)
-end
-
 --
 -- Evaluate command on local server
 --
@@ -75,7 +68,7 @@ local function local_eval(self, line)
     if not fun then
         return format(false, errmsg)
     end
-    return local_format(pcall(fun))
+    return format(pcall(fun))
 end
 
 local function eval(line)
@@ -86,34 +79,22 @@ end
 -- Evaluate command on remote server
 --
 local function remote_eval(self, line)
-    if not line then
-        if type(self.on_client_disconnect) == 'function' then
-            self:on_client_disconnect()
-        end
-        pcall(self.remote.close, self.remote)
+    if not line or self.remote.state ~= 'active' then
+        local err = self.remote.error
+        self.remote:close()
         self.remote = nil
+        -- restore local REPL mode
         self.eval = nil
         self.prompt = nil
         self.completion = nil
-        return ""
+        pcall(self.on_client_disconnect, self)
+        return (err and format(false, err)) or ''
     end
     --
-    -- console connection: execute line as is
+    -- execute line
     --
-    if self.remote.console then
-        return self.remote:console(line)
-    end
-    --
-    -- binary connection: call remote 'console.eval' function
-    --
-    local status, res = pcall(self.remote.eval, self.remote,
-        "return require('console').eval(...)", line)
-    if not status then
-        -- remote request failed
-        return format(status, res)
-    end
-    -- return formatted output from remote
-    return res
+    local ok, res = pcall(self.remote.eval, self.remote, line)
+    return ok and res or format(false, res)
 end
 
 --
@@ -153,6 +134,9 @@ local function local_read(self)
         prompt = string.rep(' ', #self.prompt)
     end
     internal.add_history(buf)
+    if self.history_file then
+        internal.save_history(self.history_file)
+    end
     return buf
 end
 
@@ -288,6 +272,11 @@ local function start()
     end
     started = true
     local self = setmetatable({ running = true }, repl_mt)
+    local home_dir = os.getenv('HOME')
+    if home_dir then
+        self.history_file = home_dir .. '/.tarantool_history'
+        internal.load_history(self.history_file)
+    end
     repl(self)
     started = false
 end
@@ -295,7 +284,12 @@ end
 --
 -- Connect to remove server
 --
+local netbox_connect
 local function connect(uri)
+    if not netbox_connect then -- workaround the broken loader
+        netbox_connect = require('net.box').connect
+    end
+
     local self = fiber.self().storage.console
     if self == nil then
         error("console.connect() need existing console")
@@ -310,33 +304,36 @@ local function connect(uri)
     end
 
     -- connect to remote host
-    local remote = require('net.box'):new(u.host, u.service,
-        { user = u.login, password = u.password })
+    local remote
+    remote = netbox_connect(u.host, u.service, {
+        user = u.login, password = u.password, console = true
+    })
+    remote.host, remote.port = u.host or 'localhost', u.service
 
-    -- run disconnect trigger
-    if remote.state == 'closed' then
-        if type(self.on_client_disconnect) == 'function' then
-            self:on_client_disconnect()
-        end
+    -- run disconnect trigger if connection failed
+    if not remote:is_connected() then
+        pcall(self.on_client_disconnect, self)
+        error('Connection is not established: '..remote.error)
     end
 
     -- check connection && permissions
-    local status, reason
-    if remote.console then
-        status, reason = pcall(remote.console, remote, 'return true')
-    else
-        status, reason = pcall(remote.eval, remote, 'return true')
-    end
-    if not status then
-        remote:close() -- don't leak net.box connection
-        error(reason) -- re-throw original error (there is no better way)
+    local ok, res = pcall(remote.eval, remote, 'return true')
+    if not ok then
+        remote:close()
+        pcall(self.on_client_disconnect, self)
+        error(res)
     end
 
     -- override methods
     self.remote = remote
     self.eval = remote_eval
     self.prompt = string.format("%s:%s", self.remote.host, self.remote.port)
-    self.completion = function () end -- no completion for remote console
+    self.completion = function (str, pos1, pos2)
+        local c = string.format(
+            'return require("console").completion_handler(%q, %d, %d)',
+            str, pos1, pos2)
+        return yaml.decode(remote:eval(c))[1]
+    end
     log.info("connected to %s:%s", self.remote.host, self.remote.port)
     return true
 end
@@ -349,7 +346,7 @@ local function client_handler(client, peer)
         print = client_print;
         client = client;
     }, repl_mt)
-    local version = ffi.string(_TARANTOOL)
+    local version = _TARANTOOL
     state:print(string.format("%-63s\n%-63s\n",
         "Tarantool ".. version.." (Lua console)",
         "type 'help' for interactive help"))
@@ -391,4 +388,5 @@ return {
     listen = listen;
     on_start = on_start;
     on_client_disconnect = on_client_disconnect;
+    completion_handler = internal.completion_handler;
 }

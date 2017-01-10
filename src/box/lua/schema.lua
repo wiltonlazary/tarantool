@@ -4,6 +4,7 @@ local ffi = require('ffi')
 local msgpack = require('msgpack')
 local msgpackffi = require('msgpackffi')
 local fun = require('fun')
+local log = require('log')
 local session = box.session
 local internal = require('box.internal')
 
@@ -55,8 +56,6 @@ ffi.cdef[[
     /** \cond public */
     int
     box_txn_begin();
-    void
-    box_txn_rollback();
     /** \endcond public */
 
     struct port_entry {
@@ -145,10 +144,9 @@ end
  @example
  check_param_table(options, { user = 'string',
                               port = 'string, number',
-                              data = 'any',
-                              allow_unexpected = false } )
+                              data = 'any'} )
 --]]
-local function check_param_table(table, template, allow_unexpected)
+local function check_param_table(table, template)
     if table == nil then
         return
     end
@@ -162,12 +160,8 @@ local function check_param_table(table, template, allow_unexpected)
     end
     for k,v in pairs(table) do
         if template[k] == nil then
-            if not allow_unexpected then
-                box.error(box.error.ILLEGAL_PARAMS,
-                          "unexpected option '" .. k .. "'")
-            else
-                -- option will be checked by C code
-            end
+            box.error(box.error.ILLEGAL_PARAMS,
+                      "unexpected option '" .. k .. "'")
         elseif template[k] == 'any' then
             -- any type is ok
         elseif (string.find(template[k], ',') == nil) then
@@ -233,8 +227,7 @@ box.begin = function()
     end
 end
 -- box.commit yields, so it's defined as Lua/C binding
-
-box.rollback = builtin.box_txn_rollback;
+-- box.rollback yields as well
 
 box.schema.space = {}
 box.schema.space.create = function(name, options)
@@ -245,13 +238,15 @@ box.schema.space.create = function(name, options)
         id = 'number',
         field_count = 'number',
         user = 'string, number',
-        format = 'table'
+        format = 'table',
+        temporary = 'boolean',
     }
     local options_defaults = {
         engine = 'memtx',
         field_count = 0,
+        temporary = false,
     }
-    check_param_table(options, options_template, true)
+    check_param_table(options, options_template)
     options = update_param_table(options, options_defaults)
 
     local _space = box.space[box.schema.SPACE_ID]
@@ -283,14 +278,12 @@ box.schema.space.create = function(name, options)
         uid = session.uid()
     end
     local format = options.format and options.format or {}
-    local extra_options = setmetatable({}, { __serialize = 'map' })
-    for k, v in pairs(options) do
-        if options_template[k] == nil then
-            extra_options[k] = v
-        end
-    end
+    -- filter out global parameters from the options array
+    local space_options = setmetatable({
+        temporary = options.temporary and true or nil,
+    }, { __serialize = 'map' })
     _space:insert{id, uid, name, options.engine, options.field_count,
-        extra_options, format}
+        space_options, format}
     return box.space[id], "created"
 end
 
@@ -389,21 +382,37 @@ box.schema.index.create = function(space_id, name, options)
         id = 'number',
         if_not_exists = 'boolean',
         dimension = 'number',
-        distance = 'string'
+        distance = 'string',
+        path = 'string',
+        page_size = 'number',
+        range_size = 'number',
+        compact_wm = 'number',
     }
-    check_param_table(options, options_template, true)
+    check_param_table(options, options_template)
     local options_defaults = {
         type = 'tree',
     }
     options = update_param_table(options, options_defaults)
     local type_dependent_defaults = {
         rtree = {parts = { 2, 'array' }, unique = false},
-        bitset = {parts = { 2, 'num' }, unique = false},
-        other = {parts = { 1, 'num' }, unique = true},
+        bitset = {parts = { 2, 'unsigned' }, unique = false},
+        other = {parts = { 1, 'unsigned' }, unique = true},
     }
     options_defaults = type_dependent_defaults[options.type]
             and type_dependent_defaults[options.type]
             or type_dependent_defaults.other
+    options = update_param_table(options, options_defaults)
+    if box.space[space_id] ~= nil and box.space[space_id].engine == 'vinyl' then
+        options_defaults = {
+            -- path has no default, or, rather, it defaults
+            -- to a subdirectory of the server data dir if it is not set
+            page_size = box.cfg.vinyl.page_size,
+            range_size = box.cfg.vinyl.range_size,
+            compact_wm = box.cfg.vinyl.compact_wm,
+        }
+    else
+        options_defaults = {}
+    end
     options = update_param_table(options, options_defaults)
 
     check_index_parts(options.parts)
@@ -436,11 +445,30 @@ box.schema.index.create = function(space_id, name, options)
     for i = 1, #options.parts, 2 do
         table.insert(parts, {options.parts[i], options.parts[i + 1]})
     end
-    local key_opts = { dimension = options.dimension,
-        unique = options.unique, distance = options.distance }
-    for k, v in pairs(options) do
-        if options_template[k] == nil then
-            key_opts[k] = v
+    -- create_index() options contains type, parts, etc,
+    -- stored separately. Remove these members from key_opts
+    local key_opts = {
+            dimension = options.dimension,
+            unique = options.unique,
+            distance = options.distance,
+            path = options.path,
+            page_size = options.page_size,
+            range_size = options.range_size,
+            compact_wm = options.compact_wm,
+            lsn = box.info.cluster.signature,
+    }
+    local field_type_aliases = {
+        num = 'unsigned'; -- Deprecated since 1.7.2
+        uint = 'unsigned';
+        str = 'string';
+        int = 'integer';
+    };
+    for _, part in pairs(parts) do
+        local field_type = part[2]:lower()
+        part[2] = field_type_aliases[field_type] or field_type
+        if field_type == 'num' then
+            log.warn("field type '%s' is deprecated since Tarantool 1.7, "..
+                     "please use '%s' instead", field_type, part[2])
         end
     end
     _index:insert{space_id, iid, name, options.type, key_opts, parts}
@@ -588,7 +616,7 @@ ffi.metatype(iterator_t, {
 
 local iterator_gen = function(param, state)
     --[[
-        index:pairs() mostly confirms to the Lua for-in loop conventions and
+        index:pairs() mostly conforms to the Lua for-in loop conventions and
         tries to follow the best practices of Lua community.
 
         - this generating function is stateless.
@@ -605,8 +633,7 @@ local iterator_gen = function(param, state)
           not properly implemented here. These drawbacks can be fixed in
           future without changing this API.
 
-        Please checkout http://www.lua.org/pil/7.3.html for the further
-        information.
+        Please check out http://www.lua.org/pil/7.3.html for details.
     --]]
     if not ffi.istype(iterator_t, state) then
         error('usage: next(param, state)')
@@ -659,6 +686,11 @@ local function check_iterator_type(opts, key_is_nil)
             end
         else
             box.error(box.error.ITERATOR_TYPE, tostring(opts.iterator))
+        end
+    elseif opts and type(opts) == "string" then
+        itype = box.index[string.upper(opts)]
+        if itype == nil then
+            box.error(box.error.ITERATOR_TYPE, opts)
         end
     else
         -- Use ALL for {} and nil keys and EQ for other keys
@@ -942,13 +974,13 @@ function box.schema.space.bless(space)
         return space:insert(tuple)
     end
 
-    space_mt.pairs = function(space, key)
+    space_mt.pairs = function(space, key, opts)
         if space.index[0] == nil then
             -- empty space without indexes, return empty iterator
             return fun.iter({})
         end
         check_index(space, 0)
-        return space.index[0]:pairs(key)
+        return space.index[0]:pairs(key, opts)
     end
     space_mt.__pairs = space_mt.pairs -- Lua 5.2 compatibility
     space_mt.__ipairs = space_mt.pairs -- Lua 5.2 compatibility

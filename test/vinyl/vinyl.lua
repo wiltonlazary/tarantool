@@ -1,21 +1,15 @@
 #!/usr/bin/env tarantool
 
-require('suite')
-
-if not file_exists('./vinyl/lock') then
-	vinyl_rmdir()
-	vinyl_mkdir()
-end
-
 box.cfg {
     listen            = os.getenv("LISTEN"),
     slab_alloc_arena  = 0.5,
     slab_alloc_maximal = 4 * 1024 * 1024,
     rows_per_wal      = 1000000,
-    vinyl_dir        = "./vinyl/vinyl_test",
     vinyl = {
         threads = 3;
-        memory_limit = 0.05;
+        memory_limit = 0.5;
+        range_size = 1024*64;
+        page_size = 1024;
     }
 }
 

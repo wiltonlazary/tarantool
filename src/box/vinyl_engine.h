@@ -31,32 +31,36 @@
  * SUCH DAMAGE.
  */
 #include "engine.h"
-#include "third_party/tarantool_ev.h"
-#include "small/mempool.h"
-#include "small/region.h"
+
+struct vy_env;
 
 struct VinylEngine: public Engine {
 	VinylEngine();
 	~VinylEngine();
 	virtual void init() override;
 	virtual Handler *open() override;
-	virtual Index *createIndex(struct key_def *) override;
-	virtual void dropIndex(Index*) override;
+	virtual void addPrimaryKey(struct space *space) override;
+	virtual void buildSecondaryKey(struct space *old_space,
+				       struct space *new_space,
+				       Index *new_index) override;
 	virtual void keydefCheck(struct space *space, struct key_def *f) override;
+	virtual void beginStatement(struct txn *txn) override;
 	virtual void begin(struct txn *txn) override;
 	virtual void prepare(struct txn *txn) override;
 	virtual void commit(struct txn *txn, int64_t signature) override;
 	virtual void rollback(struct txn *txn) override;
+	virtual void rollbackStatement(struct txn *txn,
+				       struct txn_stmt *stmt) override;
 	virtual void bootstrap() override;
-	virtual void beginInitialRecovery() override;
+	virtual void beginInitialRecovery(struct vclock *vclock) override;
 	virtual void beginFinalRecovery() override;
 	virtual void endRecovery() override;
 	virtual void join(struct xstream *stream) override;
 	virtual int beginCheckpoint() override;
 	virtual int waitCheckpoint(struct vclock *vclock) override;
 public:
-	struct vinyl_env *env;
-	int recovery_complete;
+	struct vy_env *env;
+	bool recovery_complete;
 };
 
 #endif /* TARANTOOL_BOX_VINYL_ENGINE_H_INCLUDED */

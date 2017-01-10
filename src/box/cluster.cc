@@ -38,7 +38,6 @@
 
 #include "box.h"
 #include "recovery.h"
-#include "wal.h"
 #include "applier.h"
 #include "error.h"
 #include "vclock.h" /* VCLOCK_MAX */
@@ -59,7 +58,7 @@ rb_proto(, serverset_, serverset_t, struct server)
 static int
 server_compare_by_uuid(const struct server *a, const struct server *b)
 {
-	return memcmp(&a->uuid, &b->uuid, sizeof(a->uuid));
+	return tt_uuid_compare(&a->uuid, &b->uuid);
 }
 
 rb_gen(, serverset_, serverset_t, struct server, link,
@@ -72,7 +71,6 @@ rb_gen(, serverset_, serverset_t, struct server, link,
 
 static struct mempool server_pool;
 static serverset_t serverset;
-static struct ipc_channel wait_for_id;
 
 void
 cluster_init(void)
@@ -80,14 +78,12 @@ cluster_init(void)
 	mempool_create(&server_pool, &cord()->slabc,
 		       sizeof(struct server));
 	serverset_new(&serverset);
-	ipc_channel_create(&wait_for_id, 0);
 }
 
 void
 cluster_free(void)
 {
 	mempool_destroy(&server_pool);
-	ipc_channel_destroy(&wait_for_id);
 }
 
 extern "C" struct vclock *
@@ -125,16 +121,6 @@ server_delete(struct server *server)
 	mempool_free(&server_pool, server);
 }
 
-void
-cluster_wait_for_id()
-{
-	void *msg;
-	while (recovery->server_id == 0) {
-		ipc_channel_get(&wait_for_id, &msg);
-		assert(msg == NULL);
-	}
-}
-
 struct server *
 cluster_add_server(uint32_t server_id, const struct tt_uuid *server_uuid)
 {
@@ -162,14 +148,6 @@ server_set_id(struct server *server, uint32_t server_id)
 		/* Assign local server id */
 		assert(r->server_id == SERVER_ID_NIL);
 		r->server_id = server_id;
-		/*
-		 * Leave read-only mode
-		 * if this is a running server.
-		 * Otherwise, read only is switched
-		 * off after recovery_finalize().
-		 */
-		if (wal && ipc_channel_has_readers(&wait_for_id))
-			ipc_channel_put(&wait_for_id, NULL);
 	}
 }
 

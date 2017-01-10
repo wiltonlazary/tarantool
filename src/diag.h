@@ -226,6 +226,8 @@ struct error_factory {
 				     unsigned line, const char *msg);
 	struct error *(*ClientError)(const char *file, unsigned line,
 				     uint32_t errcode, ...);
+	struct error *(*SystemError)(const char *file, unsigned line,
+				     const char *format, ...);
 };
 
 struct diag *
@@ -235,8 +237,8 @@ static inline void
 diag_raise(void)
 {
 	struct error *e = diag_last_error(diag_get());
-	if (e)
-		error_raise(e);
+	assert(e != NULL);
+	error_raise(e);
 }
 
 

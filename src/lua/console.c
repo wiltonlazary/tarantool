@@ -99,7 +99,8 @@ console_completion_handler(const char *text, int start, int end)
 	 */
 	if (lua_equal(readline_L, -1, lua_upvalueindex(1))) {
 		lua_pop(readline_L, 1);
-		return lua_rl_complete(readline_L, text, start, end);
+		res = lua_rl_complete(readline_L, text, start, end);
+		goto done;
 	}
 
 	/* Slow path - arbitrary completion handler. */
@@ -107,12 +108,12 @@ console_completion_handler(const char *text, int start, int end)
 	lua_pushinteger(readline_L, start);
 	lua_pushinteger(readline_L, end);
 	if (lua_pcall(readline_L, 3, 1, 0) != 0 ||
-	    !lua_istable(readline_L, -1)) {
+	    !lua_istable(readline_L, -1) ||
+	    (n = lua_objlen(readline_L, -1)) == 0) {
 
 		lua_pop(readline_L, 1);
 		return NULL;
 	}
-	n = lua_objlen(readline_L, -1);
 	res = malloc(sizeof(res[0]) * (n + 1));
 	if (res == NULL) {
 		lua_pop(readline_L, 1);
@@ -126,6 +127,10 @@ console_completion_handler(const char *text, int start, int end)
 		lua_pop(readline_L, 1);
 	}
 	lua_pop(readline_L, 1);
+done:
+#if RL_READLINE_VERSION >= 0x0600
+	rl_completion_suppress_append = 1;
+#endif
 	return res;
 }
 
@@ -240,7 +245,7 @@ console_completion_helper(struct lua_State *L)
 	lua_createtable(L, 0, 0);
 	for (i = 0; res[i]; i++) {
 		lua_pushstring(L, res[i]);
-		lua_rawseti(L, -2, i + i);
+		lua_rawseti(L, -2, i + 1);
 	}
 	return 1;
 }
@@ -287,6 +292,26 @@ lbox_console_completion_handler(struct lua_State *L)
 }
 
 static int
+lbox_console_load_history(struct lua_State *L)
+{
+	if (!lua_isstring(L, 1))
+		luaL_error(L, "load_history(filename: string)");
+
+	read_history(lua_tostring(L, 1));
+	return 0;
+}
+
+static int
+lbox_console_save_history(struct lua_State *L)
+{
+	if (!lua_isstring(L, 1))
+		luaL_error(L, "save_history(filename: string)");
+
+	write_history(lua_tostring(L, 1));
+	return 0;
+}
+
+static int
 lbox_console_add_history(struct lua_State *L)
 {
 	if (lua_gettop(L) < 1 || !lua_isstring(L, 1))
@@ -300,6 +325,8 @@ void
 tarantool_lua_console_init(struct lua_State *L)
 {
 	static const struct luaL_reg consolelib[] = {
+		{"load_history",       lbox_console_load_history},
+		{"save_history",       lbox_console_save_history},
 		{"add_history",        lbox_console_add_history},
 		{"completion_handler", lbox_console_completion_handler},
 		{NULL, NULL}
@@ -587,8 +614,5 @@ error:
 	}
 
 	lua_settop(L, savetop);
-#if RL_READLINE_VERSION >= 0x0600
-	rl_completion_suppress_append = 1;
-#endif
 	return ml.list;
 }

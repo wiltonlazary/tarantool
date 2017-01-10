@@ -36,8 +36,8 @@
 #include "lua/msgpack.h"
 
 #include "box/txn.h"
-#include "box/request.h"
 #include "box/xrow.h"
+#include "box/iproto_constants.h"
 #include "box/iproto_port.h"
 #include "box/lua/tuple.h"
 #include "small/obuf.h"
@@ -60,7 +60,7 @@ box_lua_find(lua_State *L, const char *name, const char *name_end)
 		if (! lua_istable(L, -1)) {
 			diag_set(ClientError, ER_NO_SUCH_PROC,
 				 name_end - name, name);
-			lbox_error(L);
+			luaT_error(L);
 		}
 		start = end + 1; /* next piece of a.b.c */
 		index = lua_gettop(L); /* top of the stack */
@@ -75,7 +75,7 @@ box_lua_find(lua_State *L, const char *name, const char *name_end)
 			lua_islightuserdata(L, -1) || lua_isuserdata(L, -1) )) {
 				diag_set(ClientError, ER_NO_SUCH_PROC,
 					  name_end - name, name);
-				lbox_error(L);
+				luaT_error(L);
 		}
 		start = end + 1; /* next piece of a.b.c */
 		index = lua_gettop(L); /* top of the stack */
@@ -90,7 +90,7 @@ box_lua_find(lua_State *L, const char *name, const char *name_end)
 		 * for us, but our own message is more verbose. */
 		diag_set(ClientError, ER_NO_SUCH_PROC,
 			  name_end - name, name);
-		lbox_error(L);
+		luaT_error(L);
 	}
 	/* setting stack that it would contain only
 	 * the function pointer. */
@@ -146,7 +146,7 @@ luamp_encode_call(lua_State *L, struct luaL_serializer *cfg,
 			luaL_tofield(L, cfg, i, &field);
 			struct tuple *tuple;
 			if (field.type == MP_EXT &&
-			    (tuple = lua_istuple(L, i)) != NULL) {
+			    (tuple = luaT_istuple(L, i)) != NULL) {
 				/* `return ..., box.tuple.new(...), ...` */
 				tuple_to_mpstream(tuple, stream);
 			} else if (field.type != MP_ARRAY) {
@@ -173,7 +173,7 @@ luamp_encode_call(lua_State *L, struct luaL_serializer *cfg,
 	struct luaL_field root;
 	luaL_tofield(L, cfg, 1, &root);
 	struct tuple *tuple;
-	if (root.type == MP_EXT && (tuple = lua_istuple(L, 1)) != NULL) {
+	if (root.type == MP_EXT && (tuple = luaT_istuple(L, 1)) != NULL) {
 		/* `return box.tuple()` */
 		tuple_to_mpstream(tuple, stream);
 		return 1;
@@ -201,7 +201,7 @@ luamp_encode_call(lua_State *L, struct luaL_serializer *cfg,
 		lua_rawgeti(L, 1, t);
 		struct luaL_field field;
 		luaL_tofield(L, cfg, -1, &field);
-		if (field.type == MP_EXT && (tuple = lua_istuple(L, -1))) {
+		if (field.type == MP_EXT && (tuple = luaT_istuple(L, -1))) {
 			tuple_to_mpstream(tuple, stream);
 		} else if (field.type != MP_ARRAY) {
 			/* The first member of root table is not tuple/array */
@@ -302,14 +302,24 @@ execute_lua_call(lua_State *L)
 	 */
 	/* TODO: forbid explicit yield from __serialize or __index here */
 	if (iproto_prepare_select(out, svp) != 0)
-		lbox_error(L);
+		luaT_error(L);
 	ctx->out_is_dirty = true;
 	struct luaL_serializer *cfg = luaL_msgpack_default;
 	struct mpstream stream;
 	mpstream_init(&stream, out, obuf_reserve_cb, obuf_alloc_cb,
 		      luamp_error, L);
 
-	uint32_t count = luamp_encode_call(L, cfg, &stream);
+	int count;
+	if (request->type == IPROTO_CALL_16) {
+		/* Tarantool < 1.7.1 compatibility */
+		count = luamp_encode_call(L, cfg, &stream);
+	} else {
+		assert(request->type == IPROTO_CALL);
+		count = lua_gettop(L);
+		for (int k = 1; k <= count; ++k) {
+			luamp_encode(L, cfg, &stream, k);
+		}
+	}
 
 	mpstream_flush(&stream);
 	iproto_reply_select(out, svp, request->header->sync, count);
@@ -331,7 +341,7 @@ execute_lua_eval(lua_State *L)
 	uint32_t expr_len = mp_decode_strl(&expr);
 	if (luaL_loadbuffer(L, expr, expr_len, "=eval")) {
 		diag_set(LuajitError, lua_tostring(L, -1));
-		lbox_error(L);
+		luaT_error(L);
 	}
 
 	/* Unpack arguments */
@@ -369,7 +379,7 @@ box_process_lua(struct request *request, struct obuf *out, lua_CFunction handler
 
 	lua_State *L = lua_newthread(tarantool_L);
 	int coro_ref = luaL_ref(tarantool_L, LUA_REGISTRYINDEX);
-	int rc = lbox_cpcall(L, handler, &ctx);
+	int rc = luaT_cpcall(L, handler, &ctx);
 	luaL_unref(tarantool_L, LUA_REGISTRYINDEX, coro_ref);
 	if (rc != 0) {
 		if (ctx.out_is_dirty) {

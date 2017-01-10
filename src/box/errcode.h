@@ -78,7 +78,7 @@ struct errcode_record {
 	/* 23 */_(ER_FIELD_TYPE,		"Tuple field %u type does not match one required by operation: expected %s") \
 	/* 24 */_(ER_FIELD_TYPE_MISMATCH,	"Ambiguous field type in index '%s', key part %u. Requested type is %s but the field has previously been defined as %s") \
 	/* 25 */_(ER_SPLICE,			"SPLICE error on field %u: %s") \
-	/* 26 */_(ER_ARG_TYPE,			"Argument type in operation '%c' on field %u does not match field type: expected a %s") \
+	/* 26 */_(ER_UPDATE_ARG_TYPE,		"Argument type in operation '%c' on field %u does not match field type: expected %s") \
 	/* 27 */_(ER_TUPLE_IS_TOO_LONG,		"Tuple is too long %u") \
 	/* 28 */_(ER_UNKNOWN_UPDATE_OP,		"Unknown UPDATE operation") \
 	/* 29 */_(ER_UPDATE_FIELD,		"Field %u UPDATE error: %s") \
@@ -90,10 +90,10 @@ struct errcode_record {
 	/* 35 */_(ER_NO_SUCH_INDEX,		"No index #%u is defined in space '%s'") \
 	/* 36 */_(ER_NO_SUCH_SPACE,		"Space '%s' does not exist") \
 	/* 37 */_(ER_NO_SUCH_FIELD,		"Field %d was not found in the tuple") \
-	/* 38 */_(ER_SPACE_FIELD_COUNT,		"Tuple field count %u does not match space '%s' field count %u") \
+	/* 38 */_(ER_EXACT_FIELD_COUNT,		"Tuple field count %u does not match space field count %u") \
 	/* 39 */_(ER_INDEX_FIELD_COUNT,		"Tuple field count %u is less than required by a defined index (expected %u)") \
 	/* 40 */_(ER_WAL_IO,			"Failed to write to disk") \
-	/* 41 */_(ER_MORE_THAN_ONE_TUPLE,	"More than one tuple found by get()") \
+	/* 41 */_(ER_MORE_THAN_ONE_TUPLE,	"Get() doesn't support partial keys and non-unique indexes") \
 	/* 42 */_(ER_ACCESS_DENIED,		"%s access on %s is denied for user '%s'") \
 	/* 43 */_(ER_CREATE_USER,		"Failed to create user '%s': %s") \
 	/* 44 */_(ER_DROP_USER,			"Failed to drop user or role '%s': %s") \
@@ -171,6 +171,15 @@ struct errcode_record {
 	/*116 */_(ER_LOADING,			"Server bootstrap hasn't finished yet") \
 	/*117 */_(ER_CONNECTION_TO_SELF,	"Connection to self") \
 	/*118 */_(ER_KEY_PART_IS_TOO_LONG,	"Key part is too long: %u of %u bytes") \
+	/*119 */_(ER_COMPRESSION,		"Compression error: %s") \
+	/*120 */_(ER_SNAPSHOT_IN_PROGRESS,	"Snapshot is already in progress") \
+	/*121 */_(ER_SUB_STMT_MAX,		"Can not execute a nested statement: nesting limit reached") \
+	/*122 */_(ER_COMMIT_IN_SUB_STMT,	"Can not commit transaction in a nested statement") \
+	/*123 */_(ER_ROLLBACK_IN_SUB_STMT,	"Rollback called in a nested statement") \
+	/*124 */_(ER_DECOMPRESSION,		"Decompression error: %s") \
+	/*125 */_(ER_INVALID_XLOG_TYPE,		"Invalid xlog type: expected %s, got %s") \
+	/*126 */_(ER_INVALID_RUN_ID,		"Invalid run id: expected %lld, got %lld") \
+	/*127 */_(ER_ALREADY_RUNNING,		"Failed to lock WAL directory %s and hot_standby mode is off")
 
 /*
  * !IMPORTANT! Please follow instructions at start of the file

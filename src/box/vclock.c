@@ -29,10 +29,13 @@
  * SUCH DAMAGE.
  */
 #include "vclock.h"
-#include "say.h"
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
+
+#include "say.h"
+#include "diag.h"
 
 int64_t
 vclock_follow(struct vclock *vclock, uint32_t server_id, int64_t lsn)
@@ -54,7 +57,7 @@ vclock_follow(struct vclock *vclock, uint32_t server_id, int64_t lsn)
 	return prev_lsn;
 }
 
-static inline __attribute__ ((format(printf, 4, 0))) int
+CFORMAT(printf, 4, 0) static inline int
 rsnprintf(char **buf, char **pos, char **end, const char *fmt, ...)
 {
 	int rc = 0;
@@ -76,6 +79,7 @@ rsnprintf(char **buf, char **pos, char **end, const char *fmt, ...)
 			cap *= 2;
 		char *chunk = (char *) realloc(*buf, cap);
 		if (chunk == NULL) {
+			diag_set(OutOfMemory, cap, "malloc", "vclock");
 			free(*buf);
 			*buf = *end = *pos = NULL;
 			rc = -1;

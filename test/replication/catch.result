@@ -4,6 +4,9 @@ env = require('test_run')
 test_run = env.new()
 ---
 ...
+engine = test_run:get_cfg('engine')
+---
+...
 box.schema.user.grant('guest', 'read,write,execute', 'universe')
 ---
 ...
@@ -32,10 +35,11 @@ test_run:cmd("switch default")
 ---
 - true
 ...
-s = box.schema.space.create('test');
+s = box.schema.space.create('test', {engine = engine});
 ---
 ...
-index = s:create_index('primary', {type = 'hash'})
+-- vinyl does not support hash index
+index = s:create_index('primary', {type = (engine == 'vinyl' and 'tree' or 'hash') })
 ---
 ...
 test_run:cmd("switch replica")
@@ -83,9 +87,9 @@ test_run:cmd("switch replica")
 --
 -- #1: delete tuple on replica
 --
-box.space.test:len()
+box.space.test ~= nil
 ---
-- 1
+- true
 ...
 d = box.space.test:delete{1}
 ---
@@ -103,7 +107,7 @@ test_run:cmd("set variable r_uri to 'replica.listen'")
 ---
 - true
 ...
-c = net_box:new(r_uri)
+c = net_box.connect(r_uri)
 ---
 ...
 d = c.space.test:delete{1}
@@ -131,5 +135,8 @@ box.space.test:drop()
 ---
 ...
 box.schema.user.revoke('guest', 'replication')
+---
+...
+box.schema.user.revoke('guest', 'read,write,execute', 'universe')
 ---
 ...

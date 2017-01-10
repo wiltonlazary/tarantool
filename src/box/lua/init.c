@@ -34,7 +34,7 @@
 #include <lauxlib.h>
 #include <lualib.h>
 
-#include "lua/utils.h" /* lbox_error() */
+#include "lua/utils.h" /* luaT_error() */
 
 #include "box/box.h"
 #include "box/txn.h"
@@ -51,7 +51,7 @@
 #include "box/lua/session.h"
 #include "box/lua/net_box.h"
 #include "box/lua/cfg.h"
-
+#include "box/lua/xlog.h"
 
 extern char session_lua[],
 	tuple_lua[],
@@ -76,7 +76,16 @@ static int
 lbox_commit(lua_State *L)
 {
 	if (box_txn_commit() != 0)
-		return lbox_error(L);
+		return luaT_error(L);
+	return 0;
+}
+
+static int
+lbox_rollback(lua_State *L)
+{
+	(void)L;
+	if (box_txn_rollback() != 0)
+		return luaT_error(L);
 	return 0;
 }
 
@@ -88,14 +97,13 @@ lbox_snapshot(struct lua_State *L)
 		lua_pushstring(L, "ok");
 		return 1;
 	}
-	luaL_error(L, "can't save snapshot, errno %d (%s)",
-		   ret, strerror(ret));
-	return 1;
+	return luaT_error(L);
 }
 
 static const struct luaL_reg boxlib[] = {
-	{"snapshot", lbox_snapshot},
 	{"commit", lbox_commit},
+	{"rollback", lbox_rollback},
+	{"snapshot", lbox_snapshot},
 	{NULL, NULL}
 };
 
@@ -119,6 +127,7 @@ box_lua_init(struct lua_State *L)
 	box_lua_info_init(L);
 	box_lua_stat_init(L);
 	box_lua_session_init(L);
+	box_lua_xlog_init(L);
 	luaopen_net_box(L);
 	lua_pop(L, 1);
 

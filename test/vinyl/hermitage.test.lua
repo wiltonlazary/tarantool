@@ -7,33 +7,16 @@
 -- *************************************************************************
 -- 1.7 setup begins
 -- *************************************************************************
-net = require('net.box')
-address  = os.getenv('ADMIN')
-box.schema.user.grant('guest', 'read,write,execute', 'universe')
-yaml = require('yaml')
 test_run = require('test_run').new()
+txn_proxy = require('txn_proxy')
 
 _ = box.schema.space.create('test', {engine = 'vinyl'})
 _ = box.space.test:create_index('pk')
 
-c1 = net:new(address)
-c2 = net.new(address)
-c3 = net.new(address)
+c1 = txn_proxy.new()
+c2 = txn_proxy.new()
+c3 = txn_proxy.new()
 
-
-test_run:cmd("setopt delimiter ';'")
-getmetatable(c1).__call = function(c, command)
-    local f = yaml.decode(c:console(command))
-    if type(f) == 'table' then
-        setmetatable(f, {__serialize='array'})
-    end
-    return f
-end;
-test_run:cmd("setopt delimiter ''");
-methods = getmetatable(c1)['__index']
-methods.begin = function(c) return c("box.begin()") end
-methods.commit = function(c) return c("box.commit()") end
-methods.rollback = function(c) return c("box.rollback()") end
 t = box.space.test
 -- *************************************************************************
 -- 1.7 setup up marker: end of test setup
@@ -56,9 +39,9 @@ c2("t:replace{1, 12}")
 c1("t:replace{2, 21}")
 c1:commit()
 c2("t:replace{2, 22}")
-c2:commit() -- rollback
-t:get{1} -- {1, 11}
-t:get{2} -- {2, 21}
+c2:commit() -- success, the last writer wins
+t:get{1} -- {1, 12}
+t:get{2} -- {2, 22}
 
 -- teardown
 t:delete{1}
@@ -135,7 +118,7 @@ c2("t:replace{2, 22}")
 c1("t:get{2}") -- {2, 20}
 c2("t:get{1}") -- {1, 10}
 c1:commit() -- ok
-c2:commit() -- ok
+c2:commit() -- rollback (@fixme: not necessary)
 
 -- teardown
 t:delete{1}
@@ -157,10 +140,10 @@ c1:commit() -- ok
 c3("t:get{1}") -- {1, 11}
 c2("t:replace{2, 18}")
 c3("t:get{2}") -- {2, 19}
-c2:commit() -- rollback -- conflict
+c2:commit() -- write only transaction - OK to commit
 c3("t:get{2}") -- {2, 19}
 c3("t:get{1}") -- {1, 11}
-c3:commit()
+c3:commit() -- read only transaction - OK to commit, stays with its read view
 
 -- teardown
 t:delete{1}
@@ -306,6 +289,7 @@ c1("t:get{1}") -- {1, 10}
 c1("t:get{2}") -- {2, 20}
 c2("t:get{1}") -- {1, 10}
 c2("t:get{2}") -- {2, 20}
+c2("t:get{3}") -- {3, 30} to be inserted
 c1("t:replace{3, 30}")
 c2("t:replace{4, 42}")
 c1:commit() -- ok
@@ -368,4 +352,3 @@ box.space.test:drop()
 c1 = nil
 c2 = nil
 c3 = nil
-box.schema.user.revoke('guest', 'read,write,execute', 'universe')

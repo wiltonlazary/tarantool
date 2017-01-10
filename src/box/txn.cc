@@ -35,8 +35,15 @@
 #include "recovery.h"
 #include "wal.h"
 #include <fiber.h>
-#include "request.h" /* for request_name */
 #include "xrow.h"
+
+enum {
+	/**
+	 * Maximum recursion depth for on_replace triggers.
+	 * Large numbers may corrupt C stack.
+	 */
+	TXN_SUB_STMT_MAX = 3
+};
 
 double too_long_threshold;
 
@@ -62,7 +69,7 @@ txn_add_redo(struct txn_stmt *stmt, struct request *request)
 	row->lsn = 0;
 	row->sync = 0;
 	row->tm = 0;
-	row->bodycnt = request_encode(request, row->body);
+	row->bodycnt = request_encode_xc(request, row->body);
 	stmt->row = row;
 }
 
@@ -70,8 +77,6 @@ txn_add_redo(struct txn_stmt *stmt, struct request *request)
 static struct txn_stmt *
 txn_stmt_new(struct txn *txn)
 {
-	assert(txn->in_stmt == false);
-	assert(stailq_empty(&txn->stmts) || !txn->is_autocommit);
 	struct txn_stmt *stmt;
 	stmt = region_alloc_object_xc(&fiber()->gc, struct txn_stmt);
 
@@ -79,11 +84,11 @@ txn_stmt_new(struct txn *txn)
 	stmt->space = NULL;
 	stmt->old_tuple = NULL;
 	stmt->new_tuple = NULL;
+	stmt->engine_savepoint = NULL;
 	stmt->row = NULL;
 
 	stailq_add_tail_entry(&txn->stmts, stmt, next);
-
-	txn->in_stmt = true;
+	++txn->in_sub_stmt;
 	return stmt;
 }
 
@@ -97,7 +102,7 @@ txn_begin(bool is_autocommit)
 	txn->n_rows = 0;
 	txn->is_autocommit = is_autocommit;
 	txn->has_triggers  = false;
-	txn->in_stmt = false;
+	txn->in_sub_stmt = 0;
 	txn->engine = NULL;
 	txn->engine_tx = NULL;
 	/* fiber_on_yield/fiber_on_stop initialized by engine on demand */
@@ -106,9 +111,8 @@ txn_begin(bool is_autocommit)
 }
 
 void
-txn_begin_in_engine(struct txn *txn, struct space *space)
+txn_begin_in_engine(Engine *engine, struct txn *txn)
 {
-	Engine *engine = space->handler->engine;
 	if (txn->engine == NULL) {
 		assert(stailq_empty(&txn->stmts));
 		txn->engine = engine;
@@ -128,11 +132,15 @@ txn_begin_stmt(struct space *space)
 	struct txn *txn = in_txn();
 	if (txn == NULL)
 		txn = txn_begin(true);
+	else if (txn->in_sub_stmt > TXN_SUB_STMT_MAX)
+		tnt_raise(ClientError, ER_SUB_STMT_MAX);
 
-	txn_begin_in_engine(txn, space);
-
+	Engine *engine = space->handler->engine;
+	txn_begin_in_engine(engine, txn);
 	struct txn_stmt *stmt = txn_stmt_new(txn);
 	stmt->space = space;
+
+	engine->beginStatement(txn);
 	return txn;
 }
 
@@ -143,7 +151,7 @@ txn_begin_stmt(struct space *space)
 void
 txn_commit_stmt(struct txn *txn, struct request *request)
 {
-	assert(txn->in_stmt);
+	assert(txn->in_sub_stmt > 0);
 	/*
 	 * Run on_replace triggers. For now, disallow mutation
 	 * of tuples in the trigger.
@@ -167,11 +175,10 @@ txn_commit_stmt(struct txn *txn, struct request *request)
 	 */
 	if (!rlist_empty(&stmt->space->on_replace) &&
 	    stmt->space->run_triggers && (stmt->old_tuple || stmt->new_tuple)) {
-
 		trigger_run(&stmt->space->on_replace, txn);
 	}
-	txn->in_stmt = false;
-	if (txn->is_autocommit)
+	--txn->in_sub_stmt;
+	if (txn->is_autocommit && txn->in_sub_stmt == 0)
 		txn_commit(txn);
 }
 
@@ -271,17 +278,17 @@ txn_rollback_stmt()
 		return;
 	if (txn->is_autocommit)
 		return txn_rollback();
-	if (txn->in_stmt == false)
+	if (txn->in_sub_stmt == 0)
 		return;
 	struct txn_stmt *stmt = stailq_last_entry(&txn->stmts, struct txn_stmt,
 						  next);
-	txn->engine->rollbackStatement(stmt);
+	txn->engine->rollbackStatement(txn, stmt);
 	if (stmt->row != NULL) {
 		stmt->row = NULL;
 		--txn->n_rows;
 		assert(txn->n_rows >= 0);
 	}
-	txn->in_stmt = false;
+	--txn->in_sub_stmt;
 }
 
 void
@@ -347,6 +354,10 @@ box_txn_commit()
 	*/
 	if (! txn)
 		return 0;
+	if (txn->in_sub_stmt) {
+		diag_set(ClientError, ER_COMMIT_IN_SUB_STMT);
+		return -1;
+	}
 	try {
 		txn_commit(txn);
 	} catch (Exception *e) {
@@ -356,10 +367,16 @@ box_txn_commit()
 	return 0;
 }
 
-void
+int
 box_txn_rollback()
 {
+	struct txn *txn = in_txn();
+	if (txn && txn->in_sub_stmt) {
+		diag_set(ClientError, ER_ROLLBACK_IN_SUB_STMT);
+		return -1;
+	}
 	txn_rollback(); /* doesn't throw */
+	return 0;
 }
 
 void *

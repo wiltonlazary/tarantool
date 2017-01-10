@@ -7,5 +7,7 @@ box.cfg({
     custom_proc_title   = "hot_standby",
     wal_dir             = "master",
     snap_dir            = "master",
+    vinyl_dir           = "master",
+    hot_standby         = true,
 })
 

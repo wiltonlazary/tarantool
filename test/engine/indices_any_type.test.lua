@@ -7,7 +7,7 @@ test_run = env.new()
 engine = test_run:get_cfg('engine')
 
 s0 = box.schema.space.create('my_space1', { engine = engine })
-i0 = s0:create_index('my_space1_idx1', {type='TREE', parts={1, 'NUMBER'}, unique=true})
+i0 = s0:create_index('my_space1_idx1', {type='TREE', parts={1, 'number'}, unique=true})
 
 s0:insert({10})
 s0:insert({11})
@@ -46,7 +46,7 @@ s0:select{}
 s0:drop()
 
 s1 = box.schema.space.create('my_space2', { engine = engine })
-i1 = s1:create_index('my_space2_idx1', {type='TREE', parts={1, 'SCALAR'}, unique=true})
+i1 = s1:create_index('my_space2_idx1', {type='TREE', parts={1, 'scalar'}, unique=true})
 
 s1:insert({10})
 s1:insert({11})
@@ -92,7 +92,7 @@ s1:select{}
 s1:drop()
 
 s2 = box.schema.space.create('my_space3', { engine = engine })
-i2_1 = s2:create_index('my_space3_idx1', {type='TREE', parts={1, 'SCALAR', 2, 'INT', 3, 'NUMBER'}, unique=true})
+i2_1 = s2:create_index('my_space3_idx1', {type='TREE', parts={1, 'scalar', 2, 'integer', 3, 'number'}, unique=true})
 
 s2:insert({10, 1, -1, 'z', true})
 s2:insert({11, 2, 2, 'g', false})
@@ -144,10 +144,66 @@ s2:drop()
 mp = require('msgpack')
 
 s4 = box.schema.space.create('my_space5', { engine = engine })
-i4_1 = s4:create_index('my_space5_idx1', {type='TREE', parts={1, 'SCALAR', 2, 'INT', 3, 'NUMBER'}, unique=true})
+i4_1 = s4:create_index('my_space5_idx1', {type='TREE', parts={1, 'scalar', 2, 'integer', 3, 'number'}, unique=true})
 s4:insert({mp.NULL, 1, 1, 1})
 s4:insert({2, mp.NULL, 2, 2}) -- all nulls must fail
 s4:insert({3, 3, mp.NULL, 3})
 s4:insert({4, 4, 4, mp.NULL})
 
 s4:drop()
+
+-- Test for nonunique indices
+
+s5 = box.schema.space.create('my_space6', { engine = engine })
+i5_1 = s5:create_index('my_space6_idx1', {type='TREE', parts={1, 'unsigned'}, unique=true})
+i5_2 = s5:create_index('my_space6_idx2', {type='TREE', parts={2, 'scalar'}, unique=false})
+
+test_run:cmd("setopt delimiter ';'");
+function less(a, b)
+    if type(a[2]) ~= type(b[2]) then
+        return type(a[2]) < type(b[2])
+    end
+    if type(a[2]) == 'boolean' then
+        if a[2] == false and b[2] == true then
+            return true
+        end
+    end
+    if a[2] == b[2] then
+        return a[1] < b[1]
+    end
+    return a[2] < b[2]
+end;
+test_run:cmd("setopt delimiter ''");
+function sort(t) table.sort(t, less) return t end
+
+s5:insert({1, "123"})
+s5:insert({2, "123"})
+s5:insert({3, "123"})
+s5:insert({4, 123})
+s5:insert({5, 123})
+s5:insert({6, true})
+s5:insert({7, true})
+s5:insert({8, mp.NULL}) -- must fail
+s5:insert({9, -40.5})
+s5:insert({10, -39.5})
+s5:insert({11, -38.5})
+s5:insert({12, 100.5})
+s5:select{}
+sort(i5_2:select({123}))
+sort(i5_2:select({"123"}))
+sort(i5_2:select({true}))
+sort(i5_2:select({false}))
+sort(i5_2:select({true}))
+sort(i5_2:select({-38.5}))
+
+sort(i5_2:select({-40}, {iterator = 'GE'}))
+
+s5:drop()
+
+-- gh-1897 Crash on index field type 'any'
+
+space = box.schema.space.create('test')
+pk = space:create_index('primary', { parts = {1, 'any'} }) --
+space:insert({1})                                          -- must fail
+space:insert({2})                                          --
+space:drop()

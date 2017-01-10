@@ -264,6 +264,18 @@ BuildLuajitError(const char *file, unsigned line, const char *msg)
 	return new (p) LuajitError(file, line, msg);
 }
 
+static struct error *
+BuildSystemError(const char *file, unsigned line, const char *format, ...)
+{
+	BuildAlloc(SystemError);
+	SystemError *e = new (p) SystemError(file, line, "");
+	va_list ap;
+	va_start(ap, format);
+	error_vformat_msg(e, format, ap);
+	va_end(ap);
+	return e;
+}
+
 #undef BuildAlloc
 
 void
@@ -276,6 +288,7 @@ exception_init()
 	exception_error_factory.TimedOut = BuildTimedOut;
 	exception_error_factory.ChannelIsClosed = BuildChannelIsClosed;
 	exception_error_factory.LuajitError = BuildLuajitError;
+	exception_error_factory.SystemError = BuildSystemError;
 
 	error_factory = &exception_error_factory;
 

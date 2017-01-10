@@ -44,6 +44,53 @@ elseif (${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
     find_package_message(PLATFORM "Building for OS X" "${CMAKE_SYSTEM_NAME}")
     find_package_message(DARWIN_BUILD_TYPE
         "DARWIN_BUILD_TYPE: ${DARWIN_BUILD_TYPE}" "${DARWIN_BUILD_TYPE}")
+
+    # In Mac OS, the dynamic linker recognizes
+    # @loader_path, @executable_path and @rpath tokens, ex:
+    #   '@loder_path/lit.dylib'
+    # means load lit from the same dir the requesting binary lives in.
+    # Since our dynamic libraries aren't intended for static linking,
+    # this is pretty much irrelevant. Disable CMake rpath features
+    # altogether. Suppresses a few warnings.
+    set(CMAKE_SKIP_RPATH true)
+
+    # Latest versions of Homebrew wont 'link --force' for libraries, that were
+    # preinstalled in system. So we'll use this dirty hack
+    find_program(HOMEBREW_EXECUTABLE brew)
+    if(EXISTS ${HOMEBREW_EXECUTABLE})
+        execute_process(COMMAND ${HOMEBREW_EXECUTABLE} --prefix
+                        OUTPUT_VARIABLE HOMEBREW_PREFIX
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        message(STATUS "Detected Homebrew install at ${HOMEBREW_PREFIX}")
+
+        # Detecting LibReadline
+        execute_process(COMMAND ${HOMEBREW_EXECUTABLE} --prefix readline
+                        OUTPUT_VARIABLE HOMEBREW_READLINE
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(DEFINED HOMEBREW_READLINE)
+            if (NOT DEFINED READLINE_ROOT)
+                message(STATUS "Setting readline root to ${HOMEBREW_READLINE}")
+                set(READLINE_ROOT "${HOMEBREW_READLINE}")
+            endif()
+        elseif(NOT DEFINED ${READLINE_ROOT})
+            message(WARNING "Homebrew's readline isn't installed. "
+                            "Work isn't guarenteed using system readline")
+        endif()
+
+        # Detecting OpenSSL
+        execute_process(COMMAND ${HOMEBREW_EXECUTABLE} --prefix openssl
+                        OUTPUT_VARIABLE HOMEBREW_OPENSSL
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if (DEFINED HOMEBREW_OPENSSL)
+            if (NOT DEFINED OPENSSL_ROOT_DIR)
+                message(STATUS "Setting OpenSSL root to ${HOMEBREW_OPENSSL}")
+                set(OPENSSL_ROOT_DIR "${HOMEBREW_OPENSSL}")
+            endif()
+        elseif(NOT DEFINED OPENSSL_ROOT_DIR)
+            message(WARNING "Homebrew's OpenSSL isn't installed. Work isn't "
+                            "guarenteed if built with system OpenSSL")
+        endif()
+    endif()
 else()
     message (FATAL_ERROR "Unsupported platform -- ${CMAKE_SYSTEM_NAME}")
 endif()

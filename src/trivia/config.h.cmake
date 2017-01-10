@@ -46,12 +46,6 @@
 #define TARANTOOL_LIBEXT "dylib"
 #endif
 
-#if defined(__CC_ARM)         /* set the alignment to 1 for armcc compiler */
-#define PACKED    __packed
-#else
-#define PACKED  __attribute__((packed))
-#endif
-
 /*
  * Defined if gcov instrumentation should be enabled.
  */
@@ -91,6 +85,7 @@
 
 #ifndef HAVE_FDATASYNC
 #if defined(__APPLE__)
+#include <fcntl.h>
 #define fdatasync(fd) fcntl(fd, F_FULLFSYNC)
 #else
 #define fdatasync fsync
@@ -189,6 +184,7 @@
 
 #cmakedefine HAVE_UUIDGEN 1
 #cmakedefine HAVE_CLOCK_GETTIME 1
+#cmakedefine HAVE_CLOCK_GETTIME_DECL 1
 
 /** pthread_np.h - non-portable stuff */
 #cmakedefine HAVE_PTHREAD_NP_H 1
@@ -198,6 +194,16 @@
 #cmakedefine HAVE_PTHREAD_SETNAME_NP_1 1
 /** pthread_set_name_np(pthread_self(), "") - *BSD */
 #cmakedefine HAVE_PTHREAD_SET_NAME_NP 1
+
+#cmakedefine HAVE_PTHREAD_GETATTR_NP 1
+#cmakedefine HAVE_PTHREAD_ATTR_GET_NP 1
+
+#if defined(HAVE_PTHREAD_ATTR_GET_NP)
+#define pthread_getattr_np pthread_attr_get_np
+#endif
+
+#cmakedefine HAVE_PTHREAD_GET_STACKSIZE_NP 1
+#cmakedefine HAVE_PTHREAD_GET_STACKADDR_NP 1
 
 #cmakedefine HAVE_SETPROCTITLE 1
 #cmakedefine HAVE_SETPROGNAME 1
@@ -232,11 +238,15 @@
 #define MODULE_LUAPATH "@MODULE_LUAPATH@"
 /** A constant added to package.cpath in Lua to find *.so module files */
 #define MODULE_LIBPATH "@MODULE_LIBPATH@"
+/** Shared library suffix - ".so" on Linux, ".dylib" on Mac */
+#define MODULE_LIBSUFFIX "@MODULE_LIBSUFFIX@"
 
 /** \endcond public */
 
 #define DEFAULT_CFG_FILENAME "tarantool.cfg"
 #define DEFAULT_CFG SYSCONF_DIR "/" DEFAULT_CFG_FILENAME
+
+#cmakedefine ENABLE_ASAN 1
 
 /*
  * vim: syntax=c

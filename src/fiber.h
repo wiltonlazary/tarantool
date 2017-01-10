@@ -188,8 +188,9 @@ fiber_set_joinable(struct fiber *fiber, bool yesno);
  * @pre FIBER_IS_JOINABLE flag is set.
  *
  * \param f fiber to be woken up
+ * \return fiber function ret code
  */
-API_EXPORT void
+API_EXPORT int
 fiber_join(struct fiber *f);
 
 /**
@@ -276,6 +277,7 @@ struct fiber {
 	 */
 	fiber_func f;
 	va_list f_data;
+	int f_ret;
 	/** Fiber local storage */
 	void *fls[FIBER_KEY_MAX];
 	/** Exception which caused this fiber's death. */
@@ -292,7 +294,7 @@ enum { FIBER_CALL_STACK = 16 };
 struct fiber_pool {
 	struct {
 		/** Cache of fibers which work on incoming messages. */
-		struct rlist idle;
+		alignas(CACHELINE_SIZE) struct rlist idle;
 		/** The number of fibers in the pool. */
 		int size;
 		/** The limit on the number of fibers working on tasks. */
@@ -305,11 +307,10 @@ struct fiber_pool {
 		/** Staged messages (for fibers to work on) */
 		struct stailq output;
 		struct ev_timer idle_timer;
-	} __attribute__((aligned(CACHELINE_SIZE)));
+	};
 	struct {
-
 		/** The consumer thread loop. */
-		struct ev_loop *consumer;
+		alignas(CACHELINE_SIZE) struct ev_loop *consumer;
 		/**
 		 * Used to trigger task processing when
 		 * the pipe becomes non-empty.
@@ -319,7 +320,7 @@ struct fiber_pool {
 		pthread_mutex_t mutex;
 		/** The pipe with incoming messages. */
 		struct stailq pipe;
-	} __attribute__((aligned(CACHELINE_SIZE)));
+	};
 	fiber_func f;
 };
 #undef CACHELINE_SIZE
@@ -428,7 +429,8 @@ cord_costart(struct cord *cord, const char *name, fiber_func f, void *arg);
  * @param cord cord
  * @sa pthread_join()
  *
- * @return 0 on success, pthread_join return code on error
+ * @return 0 on success, -1 if pthread_join failed or the
+ * thread function terminated with an exception.
  */
 int
 cord_cojoin(struct cord *cord);
@@ -441,11 +443,8 @@ cord_cojoin(struct cord *cord);
  * preserves the exception in the caller's cord.
  *
  * @param cord cord
- * @retval  0  pthread_join succeeded.
- *             If the thread function terminated with an
- *             exception, the exception is raised in the
- *             caller cord.
- * @retval -1   pthread_join failed.
+ * @return 0 on success, -1 if pthread_join failed or the
+ * thread function terminated with an exception.
  */
 int
 cord_join(struct cord *cord);

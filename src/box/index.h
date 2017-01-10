@@ -186,9 +186,7 @@ box_index_get(uint32_t space_id, uint32_t index_id, const char *key,
  * \param space_id space identifier
  * \param index_id index identifier
  * \param key encoded key in MsgPack Array format ([part1, part2, ...]).
- * If NULL then equvivalent to an empty array.
  * \param key_end the end of encoded \a key.
- * Must be NULL if \a key is NULL.
  * \param[out] result a tuple or NULL if index is empty
  * \retval -1 on error (check box_error_last())
  * \retval 0 on success
@@ -204,9 +202,7 @@ box_index_min(uint32_t space_id, uint32_t index_id, const char *key,
  * \param space_id space identifier
  * \param index_id index identifier
  * \param key encoded key in MsgPack Array format ([part1, part2, ...]).
- * If NULL then equvivalent to an empty array.
  * \param key_end the end of encoded \a key.
- * Must be NULL if \a key is NULL.
  * \param[out] result a tuple or NULL if index is empty
  * \retval -1 on error (check box_error_last())
  * \retval 0 on success
@@ -223,9 +219,7 @@ box_index_max(uint32_t space_id, uint32_t index_id, const char *key,
  * \param index_id index identifier
  * \param type iterator type - enum \link iterator_type \endlink
  * \param key encoded key in MsgPack Array format ([part1, part2, ...]).
- * If NULL then equvivalent to an empty array.
  * \param key_end the end of encoded \a key.
- * Must be NULL if \a key is NULL.
  * \retval -1 on error (check box_error_last())
  * \retval >=0 on success
  * \sa \code box.space[space_id].index[index_id]:count(key,
@@ -250,7 +244,7 @@ struct iterator {
 	uint32_t sc_version;
 	uint32_t space_id;
 	uint32_t index_id;
-	class Index *index;
+	struct Index *index;
 };
 
 static inline bool
@@ -267,16 +261,21 @@ iterator_type_is_reverse(enum iterator_type type)
  * @param type iterator type (see enum iterator_type)
  * @param key msgpack-encoded key
  * @param part_count number of parts in \a key
+ *
+ * @retval 0  The key is valid.
+ * @retval -1 The key is invalid.
  */
-void
+int
 key_validate(struct key_def *key_def, enum iterator_type type, const char *key,
 	     uint32_t part_count);
 
 /**
  * Check that the supplied key is valid for a search in a unique
  * index (i.e. the key must be fully specified).
+ * @retval 0  The key is valid.
+ * @retval -1 The key is invalid.
  */
-void
+int
 primary_key_validate(struct key_def *key_def, const char *key,
 		     uint32_t part_count);
 
@@ -303,7 +302,7 @@ enum dup_replace_mode {
 	DUP_REPLACE
 };
 
-class Index {
+struct Index {
 public:
 	/* Description of a possibly multipart key. */
 	struct key_def *key_def;

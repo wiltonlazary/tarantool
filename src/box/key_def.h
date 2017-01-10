@@ -50,7 +50,7 @@ enum {
 	BOX_SPACE_MAX = INT32_MAX,
 	BOX_FUNCTION_MAX = 32000,
 	BOX_INDEX_MAX = 128,
-	BOX_NAME_MAX = 32,
+	BOX_NAME_MAX = 64,
 	BOX_FIELD_MAX = INT32_MAX,
 	BOX_USER_MAX = 32,
 	/**
@@ -87,7 +87,16 @@ schema_object_name(enum schema_object_type type);
  * since there is a mismatch between enum name (STRING) and type
  * name literal ("STR"). STR is already used as Objective C type.
  */
-enum field_type { UNKNOWN = 0, NUM, STRING, ARRAY, NUMBER, INT, SCALAR, field_type_MAX };
+enum field_type {
+	FIELD_TYPE_ANY = 0,
+	FIELD_TYPE_UNSIGNED,
+	FIELD_TYPE_STRING,
+	FIELD_TYPE_ARRAY,
+	FIELD_TYPE_NUMBER,
+	FIELD_TYPE_INTEGER,
+	FIELD_TYPE_SCALAR,
+	field_type_MAX
+};
 extern const char *field_type_strs[];
 
 /* MsgPack type names */
@@ -110,6 +119,9 @@ field_type_maxlen(enum field_type type)
 		{ UINT32_MAX, 8, UINT32_MAX, UINT32_MAX, UINT32_MAX };
 	return maxlen[type];
 }
+
+enum field_type
+field_type_by_name(const char *name);
 
 enum index_type {
 	HASH = 0, /* HASH Index */
@@ -166,11 +178,17 @@ struct key_opts {
 	 * Vinyl index options.
 	 */
 	char path[PATH_MAX];
-	char compression[16];
-	uint32_t compression_key;
-	uint32_t node_size;
+	uint64_t range_size;
 	uint32_t page_size;
-	uint32_t sync;
+	/**
+	 * Begin compaction when there are more than compact_wm
+	 * runs in a range.
+	 */
+	uint32_t compact_wm;
+	/**
+	 * LSN from the time of index creation.
+	 */
+	int64_t lsn;
 };
 
 extern const struct key_opts key_opts_default;
@@ -211,7 +229,7 @@ struct key_def {
 };
 
 struct key_def *
-key_def_dup(struct key_def *def);
+key_def_dup(const struct key_def *def);
 
 /* Destroy and free a key_def. */
 void
@@ -324,7 +342,7 @@ struct space_def {
 	 * If set, each tuple
 	 * must have exactly this many fields.
 	 */
-	uint32_t field_count;
+	uint32_t exact_field_count;
 	char name[BOX_NAME_MAX + 1];
 	char engine_name[BOX_NAME_MAX + 1];
 	struct space_opts opts;
@@ -337,23 +355,21 @@ typedef struct box_function_ctx box_function_ctx_t;
 typedef int (*box_function_f)(box_function_ctx_t *ctx,
 	     const char *args, const char *args_end);
 
-#if defined(__cplusplus)
-} /* extern "C" */
-
 static inline size_t
 key_def_sizeof(uint32_t part_count)
 {
 	return sizeof(struct key_def) + sizeof(struct key_part) * (part_count + 1);
 }
 
-/** Initialize a pre-allocated key_def. */
+/**
+ * Allocate a new key definition.
+ * @retval not NULL Success.
+ * @retval NULL     Memory error.
+ */
 struct key_def *
 key_def_new(uint32_t space_id, uint32_t iid, const char *name,
-	    enum index_type type, struct key_opts *opts,
+	    enum index_type type, const struct key_opts *opts,
 	    uint32_t part_count);
-
-struct key_def *
-key_def_dup(struct key_def *def);
 
 /**
  * Copy one key def into another, preserving the membership
@@ -379,6 +395,85 @@ key_def_copy(struct key_def *to, const struct key_def *from)
 void
 key_def_set_part(struct key_def *def, uint32_t part_no,
 		 uint32_t fieldno, enum field_type type);
+
+/**
+ * Returns the part in key_def->parts for the specified fieldno.
+ * If fieldno is not in key_def->parts returns NULL.
+ */
+const struct key_part *
+key_def_find(const struct key_def *key_def, uint32_t fieldno);
+
+/**
+ * Allocate a new key_def with a set union of key parts from
+ * first and second key defs. Parts of the new key_def consist
+ * of the first key_def's parts and those parts of the second
+ * key_def that were not among the first parts.
+ * @retval not NULL Ok.
+ * @retval NULL     Memory error.
+ */
+struct key_def *
+key_def_merge(const struct key_def *first, const struct key_def *second);
+
+/**
+ * Create a key_def to fetch primary key parts from the tuple
+ * stored in a non-covering secondary index.
+ *
+ * A non-covering secondary index stores a tuple with a union
+ * of fields from the primary and secondary key. If a field is
+ * present in both indexes, it's only stored once.
+ *
+ * For example, if there's a primary key defined over fields
+ * (1, 5) and a secondary key defined over fields (7, 5), then
+ * the tuple, stored in the secondary key will contain fields (7,
+ * 5, 1) from the original tuple, in this order.
+ *
+ * The key def returned by this function for the above example
+ * will contain fields (3, 2), since it's built to operate on
+ * the secondary index tuple, and extract key parts for a look
+ * up in the primary key.
+ *
+ * All key parts in the new key_def will keep their original
+ * types.
+ *
+ * @param primary the definition of the primary key
+ * @param secondary the definition of the secondary key
+ *
+ * @retval not NULL Ok.
+ * @retval NULL     Memory error.
+ *
+ * @sa usage in vinyl_index.cc
+ */
+struct key_def *
+key_def_build_secondary_to_primary(const struct key_def *primary,
+				   const struct key_def *secondary);
+
+/**
+ * Create a key def with a set union of primary and secondary
+ * keys, used to compare such keys between each other. This
+ * key_def describes how the index is stored in the engine.
+ *
+ * @retval not NULL Ok.
+ * @retval NULL     Memory error.
+ */
+struct key_def *
+key_def_build_secondary(const struct key_def *primary,
+			const struct key_def *secondary);
+
+/*
+ * Check that parts of the key match with the key definition.
+ * @param key_def Key definition.
+ * @param key MessagePack'ed data for matching.
+ * @param part_count Field count in the key.
+ *
+ * @retval 0  The key is valid.
+ * @retval -1 The key is invalid.
+ */
+int
+key_validate_parts(struct key_def *key_def, const char *key,
+		   uint32_t part_count);
+
+#if defined(__cplusplus)
+} /* extern "C" */
 
 /** Compare two key part arrays.
  *
@@ -441,17 +536,22 @@ extern const uint32_t key_mp_type[];
  * @brief Checks if \a field_type (MsgPack) is compatible \a type (KeyDef).
  * @param type KeyDef type
  * @param field_type MsgPack type
- * @param field_no - a field number (is used to show an error message)
+ * @param field_no - a field number (is used to store an error message)
+ *
+ * @retval 0  mp_type is valid.
+ * @retval -1 mp_type is invalid.
  */
-static inline void
+static inline int
 key_mp_type_validate(enum field_type key_type, enum mp_type mp_type,
 	       int err, uint32_t field_no)
 {
 	assert(key_type < field_type_MAX);
 	assert((size_t) mp_type < CHAR_BIT * sizeof(*key_mp_type));
-	if (unlikely((key_mp_type[key_type] & (1U << mp_type)) == 0))
-		tnt_raise(ClientError, err, field_no,
-			  field_type_strs[key_type]);
+	if (unlikely((key_mp_type[key_type] & (1U << mp_type)) == 0)) {
+		diag_set(ClientError, err, field_no, field_type_strs[key_type]);
+		return -1;
+	}
+	return 0;
 }
 
 /**

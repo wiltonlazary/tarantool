@@ -260,13 +260,17 @@ schema_init()
 					      TREE /* index type */,
 					      &opts,
 					      1); /* part count */
-	key_def_set_part(key_def, 0 /* part no */, 0 /* field no */, STRING);
+	if (key_def == NULL)
+		diag_raise();
+	key_def_set_part(key_def, 0 /* part no */, 0 /* field no */,
+			 FIELD_TYPE_STRING);
 	(void) sc_space_new(&def, key_def, &on_replace_schema);
 
 	/* _space - home for all spaces. */
 	key_def->space_id = def.id = BOX_SPACE_ID;
 	snprintf(def.name, sizeof(def.name), "_space");
-	key_def_set_part(key_def, 0 /* part no */, 0 /* field no */, NUM);
+	key_def_set_part(key_def, 0 /* part no */, 0 /* field no */,
+			 FIELD_TYPE_UNSIGNED);
 
 	(void) sc_space_new(&def, key_def, &alter_space_on_replace_space);
 
@@ -304,10 +308,14 @@ schema_init()
 			      TREE /* index type */,
 			      &opts,
 			      2); /* part count */
+	if (key_def == NULL)
+		diag_raise();
 	/* space no */
-	key_def_set_part(key_def, 0 /* part no */, 0 /* field no */, NUM);
+	key_def_set_part(key_def, 0 /* part no */, 0 /* field no */,
+			 FIELD_TYPE_UNSIGNED);
 	/* index no */
-	key_def_set_part(key_def, 1 /* part no */, 1 /* field no */, NUM);
+	key_def_set_part(key_def, 1 /* part no */, 1 /* field no */,
+			 FIELD_TYPE_UNSIGNED);
 	(void) sc_space_new(&def, key_def, &alter_space_on_replace_index);
 	key_def_delete(key_def);
 }

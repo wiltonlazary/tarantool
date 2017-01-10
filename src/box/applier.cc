@@ -50,7 +50,6 @@
 
 /* TODO: add configuration options */
 static const int RECONNECT_DELAY = 1;
-static const int CONNECT_TIMEOUT = 30;
 
 STRS(applier_state, applier_STATE);
 
@@ -61,6 +60,40 @@ applier_set_state(struct applier *applier, enum applier_state state)
 	say_debug("=> %s", applier_state_strs[state] +
 		  strlen("APPLIER_"));
 	trigger_run(&applier->on_state, applier);
+}
+
+/**
+ * Write a nice error message to log file on SocketError or ClientError
+ * in applier_f().
+ */
+static inline void
+applier_log_error(struct applier *applier, struct error *e)
+{
+	uint32_t errcode = box_error_code(e);
+	if (applier->last_logged_errcode == errcode)
+		return;
+	switch (applier->state) {
+	case APPLIER_CONNECT:
+		say_info("can't connect to master");
+		break;
+	case APPLIER_CONNECTED:
+		say_info("can't join/subscribe");
+		break;
+	case APPLIER_AUTH:
+		say_info("failed to authenticate");
+		break;
+	case APPLIER_FOLLOW:
+	case APPLIER_INITIAL_JOIN:
+	case APPLIER_FINAL_JOIN:
+		say_info("can't read row");
+		break;
+	default:
+		break;
+	}
+	error_log(e);
+	if (type_cast(SocketError, e))
+		say_info("will retry every %i second", RECONNECT_DELAY);
+	applier->last_logged_errcode = errcode;
 }
 
 /**
@@ -110,21 +143,21 @@ applier_connect(struct applier *applier)
 		Exception *e = tnt_error(ClientError, ER_SERVER_UUID_MISMATCH,
 					 tt_uuid_str(&applier->uuid),
 					 tt_uuid_str(&greeting.uuid));
-		/* Log the error only once. */
-		if (!applier->warning_said)
-			e->log();
+		applier_log_error(applier, e);
 		e->raise();
+	}
+
+	if (applier->version_id != greeting.version_id) {
+		say_info("remote master is %u.%u.%u at %s\r\n",
+			 version_id_major(greeting.version_id),
+			 version_id_minor(greeting.version_id),
+			 version_id_patch(greeting.version_id),
+			 sio_strfaddr(&applier->addr, applier->addr_len));
 	}
 
 	/* Save the remote server version and UUID on connect. */
 	applier->uuid = greeting.uuid;
 	applier->version_id = greeting.version_id;
-
-	say_info("connected to %u.%u.%u at %s\r\n",
-		 version_id_major(greeting.version_id),
-		 version_id_minor(greeting.version_id),
-		 version_id_patch(greeting.version_id),
-		 sio_strfaddr(&applier->addr, applier->addr_len));
 
 	/* Don't display previous error messages in box.info.replication */
 	diag_clear(&fiber()->diag);
@@ -151,7 +184,7 @@ applier_connect(struct applier *applier)
 	if (row.type != IPROTO_OK)
 		xrow_decode_error(&row); /* auth failed */
 
-	/* auth successed */
+	/* auth succeeded */
 	say_info("authenticated");
 	applier_set_state(applier, APPLIER_CONNECTED);
 }
@@ -169,13 +202,19 @@ applier_join(struct applier *applier)
 	xrow_encode_join(&row, &SERVER_UUID);
 	coio_write_xrow(coio, &row);
 
-	/* Decode JOIN response */
-	coio_read_xrow(coio, &iobuf->in, &row);
-	if (iproto_type_is_error(row.type)) {
-		return xrow_decode_error(&row); /* re-throw error */
-	} else if (row.type != IPROTO_OK) {
-		tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
-			  (uint32_t) row.type);
+	/**
+	 * Tarantool < 1.7.0: if JOIN is successful, there is no "OK"
+	 * response, but a stream of rows from snapshot.
+	 */
+	if (applier->version_id >= version_id(1, 7, 0)) {
+		/* Decode JOIN response */
+		coio_read_xrow(coio, &iobuf->in, &row);
+		if (iproto_type_is_error(row.type)) {
+			return xrow_decode_error(&row); /* re-throw error */
+		} else if (row.type != IPROTO_OK) {
+			tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
+				  (uint32_t) row.type);
+		}
 	}
 
 	applier_set_state(applier, APPLIER_INITIAL_JOIN);
@@ -203,6 +242,12 @@ applier_join(struct applier *applier)
 	applier_set_state(applier, APPLIER_FINAL_JOIN);
 
 	/*
+	 * Tarantool < 1.7.0: there is no "final join" stage.
+	 */
+	if (applier->version_id < version_id(1, 7, 0))
+		goto finish;
+
+	/*
 	 * Receive final data.
 	 */
 	assert(applier->final_join_stream != NULL);
@@ -220,7 +265,10 @@ applier_join(struct applier *applier)
 				  (uint32_t) row.type);
 		}
 	}
-	/* Decode end of stream packet */
+finish:
+	/*
+	 * Decode end of stream packet and overwrite the last known vclock
+	 */
 	vclock_create(&applier->vclock);
 	assert(row.type == IPROTO_OK);
 	xrow_decode_vclock(&row, &applier->vclock);
@@ -248,9 +296,6 @@ applier_subscribe(struct applier *applier)
 	xrow_encode_subscribe(&row, &CLUSTER_UUID, &SERVER_UUID, &r->vclock);
 	coio_write_xrow(coio, &row);
 	applier_set_state(applier, APPLIER_FOLLOW);
-	/* Re-enable warnings after successful execution of SUBSCRIBE */
-	applier->warning_said = false;
-	vclock_create(&applier->vclock);
 
 	/*
 	 * Read SUBSCRIBE response
@@ -278,14 +323,13 @@ applier_subscribe(struct applier *applier)
 						 ER_SERVER_ID_MISMATCH,
 						 tt_uuid_str(&applier->uuid),
 						 applier->id, row.server_id);
-			/* Log the error at most once. */
-			if (!applier->warning_said)
-				e->log();
+			applier_log_error(applier, e);
 			e->raise();
 		}
 
 		/* Save the received server_id and vclock */
 		applier->id = row.server_id;
+		/* Overwrite the last known vclock from SUBSCRIBE */
 		vclock_copy(&applier->vclock, &vclock);
 	}
 	/**
@@ -295,6 +339,9 @@ applier_subscribe(struct applier *applier)
 	 * there is no "OK" response, but a stream of rows from
 	 * the binary log.
 	 */
+
+	/* Re-enable warnings after successful execution of SUBSCRIBE */
+	applier->last_logged_errcode = 0;
 
 	/*
 	 * Process a stream of rows from the binary log.
@@ -311,39 +358,6 @@ applier_subscribe(struct applier *applier)
 		iobuf_reset(iobuf);
 		fiber_gc();
 	}
-}
-
-/**
- * Write a nice error message to log file on SocketError or ClientError
- * in applier_f().
- */
-static inline void
-applier_log_error(struct applier *applier, struct error *e)
-{
-	if (applier->warning_said)
-		return;
-	switch (applier->state) {
-	case APPLIER_CONNECT:
-		say_info("can't connect to master");
-		break;
-	case APPLIER_CONNECTED:
-		say_info("can't join/subscribe");
-		break;
-	case APPLIER_AUTH:
-		say_info("failed to authenticate");
-		break;
-	case APPLIER_FOLLOW:
-	case APPLIER_INITIAL_JOIN:
-	case APPLIER_FINAL_JOIN:
-		say_info("can't read row");
-		break;
-	default:
-		break;
-	}
-	error_log(e);
-	if (type_cast(SocketError, e))
-		say_info("will retry every %i second", RECONNECT_DELAY);
-	applier->warning_said = true;
 }
 
 static inline void
@@ -386,28 +400,26 @@ applier_f(va_list ap)
 				/* Connection to itself, stop applier */
 				applier_disconnect(applier, APPLIER_OFF);
 				return 0;
-			} else if (e->errcode() != ER_LOADING) {
+			} else if (e->errcode() == ER_LOADING) {
+				/* Autobootstrap */
+				applier_log_error(applier, e);
+				goto reconnect;
+			} else if (e->errcode() == ER_ACCESS_DENIED) {
+				/* Invalid configuration */
+				applier_log_error(applier, e);
+				goto reconnect;
+			} else {
+				/* Unrecoverable errors */
 				applier_log_error(applier, e);
 				applier_disconnect(applier, APPLIER_STOPPED);
 				throw;
 			}
-			assert(e->errcode() == ER_LOADING);
-			/*
-			 * Ignore ER_LOADING
-			 */
-			if (!applier->warning_said) {
-				say_info("bootstrap in progress...");
-				applier->warning_said = true;
-			}
-			applier_disconnect(applier, APPLIER_DISCONNECTED);
-			/* fall through, try again later */
 		} catch (FiberIsCancelled *e) {
 			applier_disconnect(applier, APPLIER_OFF);
 			throw;
 		} catch (SocketError *e) {
 			applier_log_error(applier, e);
-			applier_disconnect(applier, APPLIER_DISCONNECTED);
-			/* fall through */
+			goto reconnect;
 		}
 		/* Put fiber_sleep() out of catch block.
 		 *
@@ -421,6 +433,8 @@ applier_f(va_list ap)
 		 *
 		 * See: https://github.com/tarantool/tarantool/issues/136
 		*/
+reconnect:
+		applier_disconnect(applier, APPLIER_DISCONNECTED);
 		fiber_sleep(RECONNECT_DELAY);
 	}
 	return 0;
@@ -584,7 +598,8 @@ applier_wait_for_state(struct applier_on_state *trigger, double timeout)
 }
 
 void
-applier_connect_all(struct applier **appliers, int count)
+applier_connect_all(struct applier **appliers, int count,
+		    double timeout)
 {
 	if (count == 0)
 		return; /* nothing to do */
@@ -609,7 +624,7 @@ applier_connect_all(struct applier **appliers, int count)
 	/* Memory for on_state triggers registered in appliers */
 	struct applier_on_state triggers[VCLOCK_MAX];
 	/* Wait results until this time */
-	double deadline = fiber_time() + CONNECT_TIMEOUT;
+	double deadline = fiber_time() + timeout;
 
 	/* Add triggers and start simulations connection to remote peers */
 	for (int i = 0; i < count; i++) {

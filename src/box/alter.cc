@@ -120,7 +120,7 @@ key_def_check_tuple(const struct tuple *tuple, bool *is_166plus)
 {
 	*is_166plus = true;
 	const mp_type common_template[] = {MP_UINT, MP_UINT, MP_STR, MP_STR};
-	const char *data = tuple->data;
+	const char *data = tuple_data(tuple);
 	uint32_t field_count = mp_decode_array(&data);
 	const char *field_start = data;
 	if (field_count < 6)
@@ -315,14 +315,14 @@ key_opts_decode_distance(const char *str)
  * Support function for key_def_new_from_tuple(..)
  * 1.6.6+
  * Fill key_opts structure from opts field in tuple of space _index
- * Throw an error is smth is wrong
+ * Throw an error is unrecognized option.
  */
 static void
 key_opts_create_from_field(struct key_opts *opts, const char *map)
 {
 	*opts = key_opts_default;
 	opts_create_from_field(opts, key_opts_reg, map,
-			ER_WRONG_INDEX_OPTIONS, INDEX_OPTS);
+			       ER_WRONG_INDEX_OPTIONS, INDEX_OPTS);
 	if (opts->distancebuf[0] != '\0')
 		opts->distance = key_opts_decode_distance(opts->distancebuf);
 }
@@ -364,7 +364,13 @@ key_def_fill_parts(struct key_def *key_def, const char *parts,
 		for (uint32_t j = 2; j < item_count; j++)
 			mp_next(&parts);
 		snprintf(buf, sizeof(buf), "%.*s", len, str);
-		enum field_type field_type = STR2ENUM(field_type, buf);
+		enum field_type field_type = field_type_by_name(buf);
+		if (field_type == field_type_MAX) {
+			tnt_raise(ClientError, ER_MODIFY_INDEX,
+				  key_def->name,
+				  space_name_by_id(key_def->space_id),
+				  "unknown field type");
+		}
 		key_def_set_part(key_def, i, field_no, field_type);
 	}
 }
@@ -388,7 +394,13 @@ key_def_fill_parts_165(struct key_def *key_def, const char *parts,
 		uint32_t len;
 		const char *str = mp_decode_str(&parts, &len);
 		snprintf(buf, sizeof(buf), "%.*s", len, str);
-		enum field_type field_type = STR2ENUM(field_type, buf);
+		enum field_type field_type = field_type_by_name(buf);
+		if (field_type == field_type_MAX) {
+			tnt_raise(ClientError, ER_MODIFY_INDEX,
+				  key_def->name,
+				  space_name_by_id(key_def->space_id),
+				  "unknown field type");
+		}
 		key_def_set_part(key_def, i, field_no, field_type);
 	}
 }
@@ -437,6 +449,8 @@ key_def_new_from_tuple(struct tuple *tuple)
 	}
 
 	key_def = key_def_new(id, index_id, name, type, &opts, part_count);
+	if (key_def == NULL)
+		diag_raise();
 	auto scoped_guard = make_scoped_guard([=] { key_def_delete(key_def); });
 
 	if (is_166plus) {
@@ -479,7 +493,7 @@ space_def_init_opts(struct space_def *def, struct tuple *tuple)
 	}
 
 	opts_create_from_field(&def->opts, space_opts_reg, data,
-			ER_WRONG_SPACE_OPTIONS, OPTS);
+			       ER_WRONG_SPACE_OPTIONS, OPTS);
 }
 
 /**
@@ -491,7 +505,7 @@ space_def_create_from_tuple(struct space_def *def, struct tuple *tuple,
 {
 	def->id = tuple_field_u32(tuple, ID);
 	def->uid = tuple_field_u32(tuple, UID);
-	def->field_count = tuple_field_u32(tuple, FIELD_COUNT);
+	def->exact_field_count = tuple_field_u32(tuple, FIELD_COUNT);
 	int namelen = snprintf(def->name, sizeof(def->name),
 			 "%s", tuple_field_cstr(tuple, NAME));
 	int engine_namelen = snprintf(def->engine_name, sizeof(def->engine_name),
@@ -648,10 +662,13 @@ alter_space_commit(struct trigger *trigger, void * /* event */)
 	 * The new space is ready. Time to update the space
 	 * cache with it.
 	 */
+	alter->old_space->handler->commitAlterSpace(alter->old_space,
+						    alter->new_space);
+
 	struct space *old_space = space_cache_replace(alter->new_space);
+	alter->new_space = NULL; /* for alter_space_delete(). */
 	assert(old_space == alter->old_space);
 	space_delete(old_space);
-	alter->new_space = NULL; /* for alter_space_delete(). */
 	alter_space_delete(alter);
 }
 
@@ -761,7 +778,8 @@ alter_space_do(struct txn *txn, struct alter_space *alter,
 	 * snapshot/xlog, but needs to continue staying "fully
 	 * built".
 	 */
-	alter->new_space->handler->onAlter(alter->old_space->handler);
+	alter->new_space->handler->prepareAlterSpace(alter->old_space,
+						     alter->new_space);
 
 	memcpy(alter->new_space->access, alter->old_space->access,
 	       sizeof(alter->old_space->access));
@@ -812,8 +830,8 @@ ModifySpace::prepare(struct alter_space *alter)
 			  space_name(alter->old_space),
 			  "can not change space engine");
 
-	if (def.field_count != 0 &&
-	    def.field_count != alter->old_space->def.field_count &&
+	if (def.exact_field_count != 0 &&
+	    def.exact_field_count != alter->old_space->def.exact_field_count &&
 	    space_index(alter->old_space, 0) != NULL &&
 	    space_size(alter->old_space) > 0) {
 
@@ -911,8 +929,8 @@ DropIndex::commit(struct alter_space *alter)
 {
 	if (space_index(alter->new_space, old_key_def->iid) != NULL)
 		return;
-	Index *index = index_find(alter->old_space, old_key_def->iid);
-	alter->old_space->handler->engine->dropIndex(index);
+	Index *index = index_find_xc(alter->old_space, old_key_def->iid);
+	alter->old_space->handler->dropIndex(index);
 }
 
 /** Change non-essential (no data change) properties of an index. */
@@ -1103,6 +1121,7 @@ void
 AddIndex::alter(struct alter_space *alter)
 {
 	Engine *engine = alter->new_space->handler->engine;
+
 	if (space_index(alter->old_space, 0) == NULL) {
 		if (new_key_def->iid == 0) {
 			/*
@@ -1127,44 +1146,10 @@ AddIndex::alter(struct alter_space *alter)
 		return;
 	}
 	/**
-	 * If it's a secondary key, and we're not building them
-	 * yet (i.e. it's snapshot recovery for memtx), do nothing.
+	 * Get the new index and build it.
 	 */
-	if (new_key_def->iid != 0 && !engine->needToBuildSecondaryKey(alter->new_space))
-		return;
-
-	Index *pk = index_find(alter->old_space, 0);
-	Index *new_index = index_find(alter->new_space, new_key_def->iid);
-
-	/* Now deal with any kind of add index during normal operation. */
-	struct iterator *it = pk->allocIterator();
-	IteratorGuard guard(it);
-	pk->initIterator(it, ITER_ALL, NULL, 0);
-
-	/*
-	 * The index has to be built tuple by tuple, since
-	 * there is no guarantee that all tuples satisfy
-	 * new index' constraints. If any tuple can not be
-	 * added to the index (insufficient number of fields,
-	 * etc., the build is aborted.
-	 */
-	/* Build the new index. */
-	struct tuple *tuple;
-	struct tuple_format *format = alter->new_space->format;
-	while ((tuple = it->next(it))) {
-		/*
-		 * Check that the tuple is OK according to the
-		 * new format.
-		 */
-		tuple_validate(format, tuple);
-		/*
-		 * @todo: better message if there is a duplicate.
-		 */
-		struct tuple *old_tuple =
-			new_index->replace(NULL, tuple, DUP_INSERT);
-		assert(old_tuple == NULL); /* Guaranteed by DUP_INSERT. */
-		(void) old_tuple;
-	}
+	Index *new_index = index_find_xc(alter->new_space, new_key_def->iid);
+	engine->buildSecondaryKey(alter->old_space, alter->new_space, new_index);
 	on_replace = txn_alter_trigger_new(on_replace_in_old_space,
 					   new_index);
 	trigger_add(&alter->old_space->on_replace, on_replace);
@@ -1930,20 +1915,6 @@ on_replace_dd_priv(struct trigger * /* trigger */, void *event)
 /* {{{ cluster configuration */
 
 /**
- * Parse a tuple field which is expected to contain a string
- * representation of UUID, and return a 16-byte representation.
- */
-tt_uuid
-tuple_field_uuid(struct tuple *tuple, int fieldno)
-{
-	const char *value = tuple_field_cstr(tuple, fieldno);
-	tt_uuid uuid;
-	if (tt_uuid_from_string(value, &uuid) != 0)
-		tnt_raise(ClientError, ER_INVALID_UUID, value);
-	return uuid;
-}
-
-/**
  * This trigger is invoked only upon initial recovery, when
  * reading contents of the system spaces from the snapshot.
  *
@@ -1965,7 +1936,8 @@ on_replace_dd_schema(struct trigger * /* trigger */, void *event)
 	if (strcmp(key, "cluster") == 0) {
 		if (new_tuple == NULL)
 			tnt_raise(ClientError, ER_CLUSTER_ID_IS_RO);
-		tt_uuid uu = tuple_field_uuid(new_tuple, 1);
+		tt_uuid uu;
+		tuple_field_uuid(new_tuple, 1, &uu);
 		CLUSTER_UUID = uu;
 	}
 }
@@ -1984,7 +1956,8 @@ on_commit_dd_cluster(struct trigger *trigger, void *event)
 	struct tuple *old_tuple = stmt->old_tuple;
 
 	if (new_tuple == NULL) {
-		struct tt_uuid old_uuid = tuple_field_uuid(stmt->old_tuple, 1);
+		struct tt_uuid old_uuid;
+		tuple_field_uuid(stmt->old_tuple, 1, &old_uuid);
 		struct server *server = server_by_uuid(&old_uuid);
 		assert(server != NULL);
 		server_clear_id(server);
@@ -1994,7 +1967,8 @@ on_commit_dd_cluster(struct trigger *trigger, void *event)
 	}
 
 	uint32_t id = tuple_field_u32(new_tuple, 0);
-	tt_uuid uuid = tuple_field_uuid(new_tuple, 1);
+	tt_uuid uuid;
+	tuple_field_uuid(new_tuple, 1, &uuid);
 	struct server *server = server_by_uuid(&uuid);
 	if (server != NULL) {
 		server_set_id(server, id);
@@ -2043,7 +2017,8 @@ on_replace_dd_cluster(struct trigger *trigger, void *event)
 				  (unsigned) server_id);
 		if (server_id >= VCLOCK_MAX)
 			tnt_raise(LoggedError, ER_REPLICA_MAX, server_id);
-		tt_uuid server_uuid = tuple_field_uuid(new_tuple, 1);
+		tt_uuid server_uuid;
+		tuple_field_uuid(new_tuple, 1, &server_uuid);
 		if (tt_uuid_is_nil(&server_uuid))
 			tnt_raise(ClientError, ER_INVALID_UUID,
 				  tt_uuid_str(&server_uuid));
@@ -2053,7 +2028,8 @@ on_replace_dd_cluster(struct trigger *trigger, void *event)
 			 * it requires an extra effort to keep _cluster
 			 * in sync with appliers and relays.
 			 */
-			tt_uuid old_uuid = tuple_field_uuid(old_tuple, 1);
+			tt_uuid old_uuid;
+			tuple_field_uuid(old_tuple, 1, &old_uuid);
 			if (!tt_uuid_is_equal(&server_uuid, &old_uuid)) {
 				tnt_raise(ClientError, ER_UNSUPPORTED,
 					  "Space _cluster",

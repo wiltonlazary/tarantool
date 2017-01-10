@@ -29,35 +29,20 @@
  * SUCH DAMAGE.
  */
 #include "memtx_engine.h"
+#include "memtx_space.h"
 
-#include <msgpuck.h>
-#include <small/rlist.h>
-
-#include "trivia/util.h"
-#include "main.h"
 #include "coeio_file.h"
-#include "coeio.h"
-#include "errinj.h"
 #include "scoped_guard.h"
 
 #include "tuple.h"
 #include "txn.h"
-#include "index.h"
-#include "memtx_hash.h"
 #include "memtx_tree.h"
-#include "memtx_rtree.h"
-#include "memtx_bitset.h"
-#include "space.h"
-#include "request.h"
-#include "box.h"
 #include "iproto_constants.h"
 #include "xrow.h"
 #include "xstream.h"
 #include "bootstrap.h"
 #include "cluster.h"
-#include "relay.h"
 #include "schema.h"
-#include "port.h"
 
 /** For all memory used by all indexes.
  * If you decide to use memtx_index_arena or
@@ -92,388 +77,6 @@ enum {
 	RESERVE_EXTENTS_BEFORE_REPLACE = 16
 };
 
-/**
- * A version of space_replace for a space which has
- * no indexes (is not yet fully built).
- */
-static struct tuple *
-memtx_replace_no_keys(struct space *space,
-		      struct tuple * /* old_tuple */,
-		      struct tuple * /* new_tuple */,
-		      enum dup_replace_mode /* mode */)
-{
-	Index *index = index_find(space, 0);
-	assert(index == NULL); /* not reached. */
-	(void) index;
-	return NULL;
-}
-
-typedef struct tuple *
-(*engine_replace_f)(struct space *, struct tuple *, struct tuple *,
-		    enum dup_replace_mode);
-
-
-struct MemtxSpace: public Handler {
-	MemtxSpace(Engine *e)
-		: Handler(e)
-	{
-		replace = memtx_replace_no_keys;
-	}
-	virtual ~MemtxSpace()
-	{
-		/* do nothing */
-		/* engine->close(this); */
-	}
-	virtual void
-	applySnapshotRow(struct space *space, struct request *request);
-	virtual struct tuple *
-	executeReplace(struct txn *txn, struct space *space,
-		       struct request *request);
-	virtual struct tuple *
-	executeDelete(struct txn *txn, struct space *space,
-		      struct request *request);
-	virtual struct tuple *
-	executeUpdate(struct txn *txn, struct space *space,
-		      struct request *request);
-	virtual void
-	executeUpsert(struct txn *txn, struct space *space,
-		      struct request *request);
-	virtual void
-	executeSelect(struct txn *, struct space *space,
-		      uint32_t index_id, uint32_t iterator,
-		      uint32_t offset, uint32_t limit,
-		      const char *key, const char * /* key_end */,
-		      struct port *port);
-	virtual void onAlter(Handler *old);
-public:
-	/**
-	 * @brief A single method to handle REPLACE, DELETE and UPDATE.
-	 *
-	 * @param sp space
-	 * @param old_tuple the tuple that should be removed (can be NULL)
-	 * @param new_tuple the tuple that should be inserted (can be NULL)
-	 * @param mode      dup_replace_mode, used only if new_tuple is not
-	 *                  NULL and old_tuple is NULL, and only for the
-	 *                  primary key.
-	 *
-	 * For DELETE, new_tuple must be NULL. old_tuple must be
-	 * previously found in the primary key.
-	 *
-	 * For REPLACE, old_tuple must be NULL. The additional
-	 * argument dup_replace_mode further defines how REPLACE
-	 * should proceed.
-	 *
-	 * For UPDATE, both old_tuple and new_tuple must be given,
-	 * where old_tuple must be previously found in the primary key.
-	 *
-	 * Let's consider these three cases in detail:
-	 *
-	 * 1. DELETE, old_tuple is not NULL, new_tuple is NULL
-	 *    The effect is that old_tuple is removed from all
-	 *    indexes. dup_replace_mode is ignored.
-	 *
-	 * 2. REPLACE, old_tuple is NULL, new_tuple is not NULL,
-	 *    has one simple sub-case and two with further
-	 *    ramifications:
-	 *
-	 *	A. dup_replace_mode is DUP_INSERT. Attempts to insert the
-	 *	new tuple into all indexes. If *any* of the unique indexes
-	 *	has a duplicate key, deletion is aborted, all of its
-	 *	effects are removed, and an error is thrown.
-	 *
-	 *	B. dup_replace_mode is DUP_REPLACE. It means an existing
-	 *	tuple has to be replaced with the new one. To do it, tries
-	 *	to find a tuple with a duplicate key in the primary index.
-	 *	If the tuple is not found, throws an error. Otherwise,
-	 *	replaces the old tuple with a new one in the primary key.
-	 *	Continues on to secondary keys, but if there is any
-	 *	secondary key, which has a duplicate tuple, but one which
-	 *	is different from the duplicate found in the primary key,
-	 *	aborts, puts everything back, throws an exception.
-	 *
-	 *	For example, if there is a space with 3 unique keys and
-	 *	two tuples { 1, 2, 3 } and { 3, 1, 2 }:
-	 *
-	 *	This REPLACE/DUP_REPLACE is OK: { 1, 5, 5 }
-	 *	This REPLACE/DUP_REPLACE is not OK: { 2, 2, 2 } (there
-	 *	is no tuple with key '2' in the primary key)
-	 *	This REPLACE/DUP_REPLACE is not OK: { 1, 1, 1 } (there
-	 *	is a conflicting tuple in the secondary unique key).
-	 *
-	 *	C. dup_replace_mode is DUP_REPLACE_OR_INSERT. If
-	 *	there is a duplicate tuple in the primary key, behaves the
-	 *	same way as DUP_REPLACE, otherwise behaves the same way as
-	 *	DUP_INSERT.
-	 *
-	 * 3. UPDATE has to delete the old tuple and insert a new one.
-	 *    dup_replace_mode is ignored.
-	 *    Note that old_tuple primary key doesn't have to match
-	 *    new_tuple primary key, thus a duplicate can be found.
-	 *    For this reason, and since there can be duplicates in
-	 *    other indexes, UPDATE is the same as DELETE +
-	 *    REPLACE/DUP_INSERT.
-	 *
-	 * @return old_tuple. DELETE, UPDATE and REPLACE/DUP_REPLACE
-	 * always produce an old tuple. REPLACE/DUP_INSERT always returns
-	 * NULL. REPLACE/DUP_REPLACE_OR_INSERT may or may not find
-	 * a duplicate.
-	 *
-	 * The method is all-or-nothing in all cases. Changes are either
-	 * applied to all indexes, or nothing applied at all.
-	 *
-	 * Note, that even in case of REPLACE, dup_replace_mode only
-	 * affects the primary key, for secondary keys it's always
-	 * DUP_INSERT.
-	 *
-	 * The call never removes more than one tuple: if
-	 * old_tuple is given, dup_replace_mode is ignored.
-	 * Otherwise, it's taken into account only for the
-	 * primary key.
-	 */
-	engine_replace_f replace;
-};
-
-static inline enum dup_replace_mode
-dup_replace_mode(uint32_t op)
-{
-	return op == IPROTO_INSERT ? DUP_INSERT : DUP_REPLACE_OR_INSERT;
-}
-
-/**
- * Do the plumbing necessary for correct statement-level
- * and transaction rollback.
- */
-static inline void
-memtx_txn_add_undo(struct txn *txn, struct tuple *old_tuple,
-		   struct tuple *new_tuple)
-{
-	/*
-	 * Remember the old tuple only if we replaced it
-	 * successfully, to not remove a tuple inserted by
-	 * another transaction in rollback().
-	 */
-	struct txn_stmt *stmt = txn_current_stmt(txn);
-	assert(stmt->space);
-	stmt->old_tuple = old_tuple;
-	stmt->new_tuple = new_tuple;
-}
-
-void
-MemtxSpace::applySnapshotRow(struct space *space, struct request *request)
-{
-	assert(request->type == IPROTO_INSERT);
-	struct tuple *new_tuple = tuple_new(space->format, request->tuple,
-					    request->tuple_end);
-	/* GC the new tuple if there is an exception below. */
-	TupleRef ref(new_tuple);
-	space_validate_tuple(space, new_tuple);
-	if (!rlist_empty(&space->on_replace)) {
-		/*
-		 * Emulate transactions for system spaces with triggers
-		 */
-		assert(in_txn() == NULL);
-		request->header->server_id = 0;
-		struct txn *txn = txn_begin_stmt(space);
-		try {
-			struct tuple *old_tuple = this->replace(space, NULL,
-				new_tuple, DUP_INSERT);
-			memtx_txn_add_undo(txn, old_tuple, new_tuple);
-			txn_commit_stmt(txn, request);
-		} catch (Exception *e) {
-			say_error("rollback: %s", e->errmsg);
-			txn_rollback_stmt();
-			throw;
-		}
-	} else {
-		this->replace(space, NULL, new_tuple, DUP_INSERT);
-	}
-	/** The new tuple is referenced by the primary key. */
-}
-
-struct tuple *
-MemtxSpace::executeReplace(struct txn *txn, struct space *space,
-			   struct request *request)
-{
-	struct tuple *new_tuple = tuple_new(space->format, request->tuple,
-					    request->tuple_end);
-	/* GC the new tuple if there is an exception below. */
-	TupleRef ref(new_tuple);
-	space_validate_tuple(space, new_tuple);
-	enum dup_replace_mode mode = dup_replace_mode(request->type);
-	struct tuple *old_tuple = this->replace(space, NULL, new_tuple, mode);
-	memtx_txn_add_undo(txn, old_tuple, new_tuple);
-	/** The new tuple is referenced by the primary key. */
-	return new_tuple;
-}
-
-struct tuple *
-MemtxSpace::executeDelete(struct txn *txn, struct space *space,
-			  struct request *request)
-{
-	/* Try to find the tuple by unique key. */
-	Index *pk = index_find_unique(space, request->index_id);
-	const char *key = request->key;
-	uint32_t part_count = mp_decode_array(&key);
-	primary_key_validate(pk->key_def, key, part_count);
-	struct tuple *old_tuple = pk->findByKey(key, part_count);
-	if (old_tuple == NULL)
-		return NULL;
-
-	this->replace(space, old_tuple, NULL, DUP_REPLACE_OR_INSERT);
-	memtx_txn_add_undo(txn, old_tuple, NULL);
-	return old_tuple;
-}
-
-struct tuple *
-MemtxSpace::executeUpdate(struct txn *txn, struct space *space,
-			  struct request *request)
-{
-	/* Try to find the tuple by unique key. */
-	Index *pk = index_find_unique(space, request->index_id);
-	const char *key = request->key;
-	uint32_t part_count = mp_decode_array(&key);
-	primary_key_validate(pk->key_def, key, part_count);
-	struct tuple *old_tuple = pk->findByKey(key, part_count);
-
-	if (old_tuple == NULL)
-		return NULL;
-
-	/* Update the tuple; legacy, request ops are in request->tuple */
-	struct tuple *new_tuple = tuple_update(space->format,
-					       region_aligned_alloc_xc_cb,
-					       &fiber()->gc,
-					       old_tuple, request->tuple,
-					       request->tuple_end,
-					       request->index_base);
-	TupleRef ref(new_tuple);
-	space_validate_tuple(space, new_tuple);
-	this->replace(space, old_tuple, new_tuple, DUP_REPLACE);
-	memtx_txn_add_undo(txn, old_tuple, new_tuple);
-	return new_tuple;
-}
-
-void
-MemtxSpace::executeUpsert(struct txn *txn, struct space *space,
-			  struct request *request)
-{
-	Index *pk = index_find_unique(space, request->index_id);
-
-	/* Check field count in tuple */
-	space_validate_tuple_raw(space, request->tuple);
-	/* Check tuple fields */
-	tuple_validate_raw(space->format, request->tuple);
-
-	struct key_def *key_def = pk->key_def;
-	uint32_t part_count = pk->key_def->part_count;
-	/*
-	 * Extract the primary key from tuple.
-	 * Allocate enough memory to store the key.
-	 */
-	const char *key = tuple_extract_key_raw(request->tuple,
-						request->tuple_end,
-						key_def, NULL);
-	/* Cut array header */
-	mp_decode_array(&key);
-
-	/* Try to find the tuple by primary key. */
-	struct tuple *old_tuple = pk->findByKey(key, part_count);
-
-	if (old_tuple == NULL) {
-		/**
-		 * Old tuple was not found. In a "true"
-		 * non-reading-write engine, this is known only
-		 * after commit. Thus any error that can happen
-		 * at this point is ignored. Emulate this by
-		 * suppressing the error. It's logged and ignored.
-		 *
-		 * Taking into account that:
-		 * 1) Default tuple fields are already fully checked
-		 *    at the beginning of the function
-		 * 2) Space with unique secondary indexes does not support
-		 *    upsert and we can't get duplicate error
-		 *
-		 * Thus we could get only OOM error, but according to
-		 *   https://github.com/tarantool/tarantool/issues/1156
-		 *   we should not suppress it
-		 *
-		 * So we have nothing to catch and suppress!
-		 */
-		struct tuple *new_tuple = tuple_new(space->format,
-						    request->tuple,
-						    request->tuple_end);
-		TupleRef ref(new_tuple); /* useless, for unified approach */
-		old_tuple = replace(space, NULL, new_tuple, DUP_INSERT);
-		memtx_txn_add_undo(txn, old_tuple, new_tuple);
-	} else {
-		/**
-		 * Update the tuple.
-		 * tuple_upsert throws on totally wrong tuple ops,
-		 * but ignores ops that not suitable for the tuple
-		 */
-		struct tuple *new_tuple =
-			tuple_upsert(space->format, region_aligned_alloc_xc_cb,
-				     &fiber()->gc, old_tuple,
-				     request->ops, request->ops_end,
-				     request->index_base);
-		TupleRef ref(new_tuple);
-
-		/**
-		 * Ignore and log all client exceptions,
-		 * note that OutOfMemory is not catched.
-		 */
-		try {
-			space_validate_tuple(space, new_tuple);
-			replace(space, old_tuple, new_tuple, DUP_REPLACE);
-			memtx_txn_add_undo(txn, old_tuple, new_tuple);
-		} catch (ClientError *e) {
-			say_error("UPSERT failed:");
-			e->log();
-		}
-	}
-	/* Return nothing: UPSERT does not return data. */
-}
-
-void
-MemtxSpace::onAlter(Handler *old)
-{
-	MemtxSpace *handler = (MemtxSpace *) old;
-	replace = handler->replace;
-}
-
-void
-MemtxSpace::executeSelect(struct txn *, struct space *space,
-			  uint32_t index_id, uint32_t iterator,
-			  uint32_t offset, uint32_t limit,
-			  const char *key, const char * /* key_end */,
-			  struct port *port)
-{
-	MemtxIndex *index = (MemtxIndex *) index_find(space, index_id);
-
-	ERROR_INJECT_EXCEPTION(ERRINJ_TESTING);
-
-	uint32_t found = 0;
-	if (iterator >= iterator_type_MAX)
-		tnt_raise(IllegalParams, "Invalid iterator type");
-	enum iterator_type type = (enum iterator_type) iterator;
-
-	uint32_t part_count = key ? mp_decode_array(&key) : 0;
-	key_validate(index->key_def, type, key, part_count);
-
-	struct iterator *it = index->position();
-	index->initIterator(it, type, key, part_count);
-
-	struct tuple *tuple;
-	while ((tuple = it->next(it)) != NULL) {
-		if (offset > 0) {
-			offset--;
-			continue;
-		}
-		if (limit == found++)
-			break;
-		port_add_tuple(port, tuple);
-	}
-}
-
 static void
 txn_on_yield_or_stop(struct trigger * /* trigger */, void * /* event */)
 {
@@ -484,14 +87,13 @@ txn_on_yield_or_stop(struct trigger * /* trigger */, void * /* event */)
  * A short-cut version of replace() used during bulk load
  * from snapshot.
  */
-static struct tuple *
-memtx_replace_build_next(struct space *space,
-			 struct tuple *old_tuple, struct tuple *new_tuple,
+static void
+memtx_replace_build_next(struct txn_stmt *stmt, struct space *space,
 			 enum dup_replace_mode mode)
 {
-	assert(old_tuple == NULL && mode == DUP_INSERT);
+	assert(stmt->old_tuple == NULL && mode == DUP_INSERT);
 	(void) mode;
-	if (old_tuple) {
+	if (stmt->old_tuple) {
 		/*
 		 * Called from txn_rollback() In practice
 		 * is impossible: all possible checks for tuple
@@ -501,29 +103,29 @@ memtx_replace_build_next(struct space *space,
 		panic("Failed to commit transaction when loading "
 		      "from snapshot");
 	}
-	((MemtxIndex *) space->index[0])->buildNext(new_tuple);
-	tuple_ref(new_tuple);
-	return NULL;
+	((MemtxIndex *) space->index[0])->buildNext(stmt->new_tuple);
+	stmt->engine_savepoint = stmt;
 }
 
 /**
  * A short-cut version of replace() used when loading
  * data from XLOG files.
  */
-static struct tuple *
-memtx_replace_primary_key(struct space *space, struct tuple *old_tuple,
-			  struct tuple *new_tuple, enum dup_replace_mode mode)
+static void
+memtx_replace_primary_key(struct txn_stmt *stmt, struct space *space,
+			  enum dup_replace_mode mode)
 {
-	old_tuple = space->index[0]->replace(old_tuple, new_tuple, mode);
-	if (new_tuple)
-		tuple_ref(new_tuple);
-	return old_tuple;
+	stmt->old_tuple = space->index[0]->replace(stmt->old_tuple,
+						   stmt->new_tuple, mode);
+	stmt->engine_savepoint = stmt;
 }
 
-static struct tuple *
-memtx_replace_all_keys(struct space *space, struct tuple *old_tuple,
-		       struct tuple *new_tuple, enum dup_replace_mode mode)
+static void
+memtx_replace_all_keys(struct txn_stmt *stmt, struct space *space,
+		       enum dup_replace_mode mode)
 {
+	struct tuple *old_tuple = stmt->old_tuple;
+	struct tuple *new_tuple = stmt->new_tuple;
 	/*
 	 * Ensure we have enough slack memory to guarantee
 	 * successful statement-level rollback.
@@ -534,7 +136,7 @@ memtx_replace_all_keys(struct space *space, struct tuple *old_tuple,
 	uint32_t i = 0;
 	try {
 		/* Update the primary key */
-		Index *pk = index_find(space, 0);
+		Index *pk = index_find_xc(space, 0);
 		assert(pk->key_def->opts.is_unique);
 		/*
 		 * If old_tuple is not NULL, the index
@@ -557,9 +159,8 @@ memtx_replace_all_keys(struct space *space, struct tuple *old_tuple,
 		}
 		throw;
 	}
-	if (new_tuple)
-		tuple_ref(new_tuple);
-	return old_tuple;
+	stmt->old_tuple = old_tuple;
+	stmt->engine_savepoint = stmt;
 }
 
 static void
@@ -609,7 +210,7 @@ memtx_build_secondary_keys(struct space *space, void *param)
 
 MemtxEngine::MemtxEngine(const char *snap_dirname, bool panic_on_snap_error,
 			 bool panic_on_wal_error)
-	:Engine("memtx"),
+	:Engine("memtx", &memtx_tuple_format_vtab),
 	m_checkpoint(0),
 	m_state(MEMTX_INITIALIZED),
 	m_snap_io_rate_limit(UINT64_MAX),
@@ -647,6 +248,55 @@ MemtxEngine::lastCheckpoint(struct vclock *vclock)
 }
 
 void
+MemtxEngine::recoverSnapshot()
+{
+	if (!m_has_checkpoint)
+		return;
+
+	/* Process existing snapshot */
+	say_info("recovery start");
+	assert(m_has_checkpoint);
+	int64_t signature = m_last_checkpoint.signature;
+	const char *filename = xdir_format_filename(&m_snap_dir, signature,
+						    NONE);
+
+	say_info("recovering from `%s'", filename);
+	struct xlog_cursor cursor;
+	xlog_cursor_open_xc(&cursor, filename);
+	SERVER_UUID = cursor.meta.server_uuid;
+	auto reader_guard = make_scoped_guard([&]{
+		xlog_cursor_close(&cursor, false);
+	});
+
+	struct xrow_header row;
+	uint64_t row_count = 0;
+	while (xlog_cursor_next_xc(&cursor, &row,
+				   m_snap_dir.panic_if_error) == 0) {
+		try {
+			recoverSnapshotRow(&row);
+		} catch (ClientError *e) {
+			if (m_snap_dir.panic_if_error)
+				throw;
+			say_error("can't apply row: ");
+			e->log();
+		}
+		++row_count;
+		if (row_count % 100000 == 0)
+			say_info("%.1fM rows processed",
+				 row_count / 1000000.);
+	}
+
+	/**
+	 * We should never try to read snapshots with no EOF
+	 * marker - such snapshots are very likely corrupted and
+	 * should not be trusted.
+	 */
+	if (cursor.state != XLOG_CURSOR_EOF)
+		panic("snapshot `%s' has no EOF marker", filename);
+
+}
+
+void
 MemtxEngine::recoverSnapshotRow(struct xrow_header *row)
 {
 	assert(row->bodycnt == 1); /* always 1 for read */
@@ -655,25 +305,27 @@ MemtxEngine::recoverSnapshotRow(struct xrow_header *row)
 			  (uint32_t) row->type);
 	}
 
-	struct request *request;
-	request = region_alloc_object_xc(&fiber()->gc, struct request);
-	request_create(request, row->type);
-	request_decode(request, (const char *) row->body[0].iov_base,
-		row->body[0].iov_len);
-	request->header = row;
-
+	struct request *request = xrow_decode_request(row);
 	struct space *space = space_cache_find(request->space_id);
 	/* memtx snapshot must contain only memtx spaces */
 	if (space->handler->engine != this)
 		tnt_raise(ClientError, ER_CROSS_ENGINE_TRANSACTION);
 	/* no access checks here - applier always works with admin privs */
-	space->handler->applySnapshotRow(space, request);
+	space->handler->applyInitialJoinRow(space, request);
+	/*
+	 * Don't let gc pool grow too much. Yet to
+	 * it before reading the next row, to make
+	 * sure it's not freed along here.
+	 */
+	fiber_gc();
+
 }
 
 /** Called at start to tell memtx to recover to a given LSN. */
 void
-MemtxEngine::beginInitialRecovery()
+MemtxEngine::beginInitialRecovery(struct vclock *vclock)
 {
+	(void) vclock;
 	assert(m_state == MEMTX_INITIALIZED);
 	/*
 	 * By default, enable fast start: bulk read of tuples
@@ -686,48 +338,6 @@ MemtxEngine::beginInitialRecovery()
 	 */
 	m_state = (m_snap_dir.panic_if_error ?
 		   MEMTX_INITIAL_RECOVERY : MEMTX_OK);
-
-	/*
-	 * JOIN from remote master - empty data directory.
-	 */
-	if (!m_has_checkpoint)
-		return;
-
-	/* Process existing snapshot */
-	say_info("recovery start");
-	assert(m_has_checkpoint);
-	int64_t signature = m_last_checkpoint.signature;
-	struct xlog *snap = xlog_open_xc(&m_snap_dir, signature);
-	auto guard = make_scoped_guard([=]{ xlog_close(snap); });
-	/* Save server UUID */
-	SERVER_UUID = snap->server_uuid;
-
-	say_info("recovering from `%s'", snap->filename);
-	struct xlog_cursor cursor;
-	xlog_cursor_open(&cursor, snap);
-	auto reader_guard = make_scoped_guard([&]{
-		xlog_cursor_close(&cursor);
-	});
-
-	struct xrow_header row;
-	while (xlog_cursor_next_xc(&cursor, &row) == 0) {
-		try {
-			recoverSnapshotRow(&row);
-		} catch (ClientError *e) {
-			if (m_snap_dir.panic_if_error)
-				throw;
-			say_error("can't apply row: ");
-			e->log();
-		}
-	}
-
-	/**
-	 * We should never try to read snapshots with no EOF
-	 * marker - such snapshots are very likely corrupted and
-	 * should not be trusted.
-	 */
-	if (!cursor.eof_read)
-		panic("snapshot `%s' has no EOF marker", snap->filename);
 }
 
 void
@@ -826,46 +436,53 @@ MemtxEngine::initSystemSpace(struct space *space)
 	memtx_add_primary_key(space, MEMTX_OK);
 }
 
-bool
-MemtxEngine::needToBuildSecondaryKey(struct space *space)
-{
-	struct MemtxSpace *handler = (struct MemtxSpace *) space->handler;
-	return handler->replace == memtx_replace_all_keys;
-}
-
-Index *
-MemtxEngine::createIndex(struct key_def *key_def)
-{
-	switch (key_def->type) {
-	case HASH:
-		return new MemtxHash(key_def);
-	case TREE:
-		return new MemtxTree(key_def);
-	case RTREE:
-		return new MemtxRTree(key_def);
-	case BITSET:
-		return new MemtxBitset(key_def);
-	default:
-		unreachable();
-		return NULL;
-	}
-}
-
 void
-MemtxEngine::dropIndex(Index *index)
+MemtxEngine::buildSecondaryKey(struct space *old_space,
+			       struct space *new_space, Index *new_index)
 {
-	if (index->key_def->iid != 0)
-		return; /* nothing to do for secondary keys */
+	struct key_def *new_key_def = new_index->key_def;
+	/**
+	 * If it's a secondary key, and we're not building them
+	 * yet (i.e. it's snapshot recovery for memtx), do nothing.
+	 */
+	if (new_key_def->iid != 0) {
+		struct MemtxSpace *handler;
+		handler = (struct MemtxSpace *) new_space->handler;
+		if (!(handler->replace == memtx_replace_all_keys))
+			return;
+	}
+	Index *pk = index_find_xc(old_space, 0);
+
+	/* Now deal with any kind of add index during normal operation. */
+	struct iterator *it = pk->allocIterator();
+	IteratorGuard guard(it);
+	pk->initIterator(it, ITER_ALL, NULL, 0);
 
 	/*
-	 * Delete all tuples in the old space if dropping the
-	 * primary key.
+	 * The index has to be built tuple by tuple, since
+	 * there is no guarantee that all tuples satisfy
+	 * new index' constraints. If any tuple can not be
+	 * added to the index (insufficient number of fields,
+	 * etc., the build is aborted.
 	 */
-	struct iterator *it = ((MemtxIndex*) index)->position();
-	index->initIterator(it, ITER_ALL, NULL, 0);
+	/* Build the new index. */
 	struct tuple *tuple;
-	while ((tuple = it->next(it)))
-		tuple_unref(tuple);
+	struct tuple_format *format = new_space->format;
+	while ((tuple = it->next(it))) {
+		/*
+		 * Check that the tuple is OK according to the
+		 * new format.
+		 */
+		if (tuple_validate(format, tuple))
+			diag_raise();
+		/*
+		 * @todo: better message if there is a duplicate.
+		 */
+		struct tuple *old_tuple =
+			new_index->replace(NULL, tuple, DUP_INSERT);
+		assert(old_tuple == NULL); /* Guaranteed by DUP_INSERT. */
+		(void) old_tuple;
+	}
 }
 
 void
@@ -896,7 +513,7 @@ MemtxEngine::keydefCheck(struct space *space, struct key_def *key_def)
 				  space_name(space),
 				  "RTREE index can not be unique");
 		}
-		if (key_def->parts[0].type != ARRAY) {
+		if (key_def->parts[0].type != FIELD_TYPE_ARRAY) {
 			tnt_raise(ClientError, ER_MODIFY_INDEX,
 				  key_def->name,
 				  space_name(space),
@@ -917,8 +534,8 @@ MemtxEngine::keydefCheck(struct space *space, struct key_def *key_def)
 				  space_name(space),
 				  "BITSET can not be unique");
 		}
-		if (key_def->parts[0].type != NUM &&
-		    key_def->parts[0].type != STRING) {
+		if (key_def->parts[0].type != FIELD_TYPE_UNSIGNED &&
+		    key_def->parts[0].type != FIELD_TYPE_STRING) {
 			tnt_raise(ClientError, ER_MODIFY_INDEX,
 				  key_def->name,
 				  space_name(space),
@@ -935,7 +552,7 @@ MemtxEngine::keydefCheck(struct space *space, struct key_def *key_def)
 	/* Only HASH and TREE indexes checks parts there */
 	/* Just check that there are no ARRAY parts */
 	for (uint32_t i = 0; i < key_def->part_count; i++) {
-		if (key_def->parts[i].type == ARRAY) {
+		if (key_def->parts[i].type == FIELD_TYPE_ARRAY) {
 			tnt_raise(ClientError, ER_MODIFY_INDEX,
 				  key_def->name,
 				  space_name(space),
@@ -984,7 +601,7 @@ MemtxEngine::begin(struct txn *txn)
 }
 
 void
-MemtxEngine::rollbackStatement(struct txn_stmt *stmt)
+MemtxEngine::rollbackStatement(struct txn *, struct txn_stmt *stmt)
 {
 	if (stmt->old_tuple == NULL && stmt->new_tuple == NULL)
 		return;
@@ -992,7 +609,10 @@ MemtxEngine::rollbackStatement(struct txn_stmt *stmt)
 	int index_count;
 	struct MemtxSpace *handler = (struct MemtxSpace *) space->handler;
 
-	if (handler->replace == memtx_replace_all_keys)
+	/* Only roll back the changes if they were made. */
+	if (stmt->engine_savepoint == NULL)
+		index_count = 0;
+	else if (handler->replace == memtx_replace_all_keys)
 		index_count = space->index_count;
 	else if (handler->replace == memtx_replace_primary_key)
 		index_count = 1;
@@ -1017,7 +637,7 @@ MemtxEngine::rollback(struct txn *txn)
 	struct txn_stmt *stmt;
 	stailq_reverse(&txn->stmts);
 	stailq_foreach_entry(stmt, &txn->stmts, next)
-		rollbackStatement(stmt);
+		rollbackStatement(txn, stmt);
 }
 
 void
@@ -1041,20 +661,25 @@ MemtxEngine::bootstrap()
 	say_info("initializing an empty data directory");
 	struct xdir dir;
 	xdir_create(&dir, "", SNAP, &uuid_nil);
-	FILE *f = fmemopen((void *) &bootstrap_bin,
-			   sizeof(bootstrap_bin), "r");
-	struct xlog *snap = xlog_open_stream_xc(&dir, 0, f, "bootstrap.snap");
 	struct xlog_cursor cursor;
-	xlog_cursor_open(&cursor, snap);
+	if (xlog_cursor_openmem(&cursor, (const char *)bootstrap_bin,
+				sizeof(bootstrap_bin), "bootstrap") < 0) {
+		diag_raise();
+	};
 	auto guard = make_scoped_guard([&]{
-		xlog_cursor_close(&cursor);
-		xlog_close(snap);
+		xlog_cursor_close(&cursor, false);
 		xdir_destroy(&dir);
 	});
 
 	struct xrow_header row;
-	while (xlog_cursor_next_xc(&cursor, &row) == 0)
+	uint64_t row_count = 0;
+	while (xlog_cursor_next_xc(&cursor, &row, true) == 0) {
 		recoverSnapshotRow(&row);
+		++row_count;
+		if (row_count % 100000 == 0)
+			say_info("%.1fM rows processed",
+				 row_count / 1000000.);
+	}
 }
 
 static void
@@ -1078,23 +703,16 @@ checkpoint_write_row(struct xlog *l, struct xrow_header *row,
 	row->lsn = ++l->rows;
 	row->sync = 0; /* don't write sync to wal */
 
-	struct iovec iov[XROW_IOVMAX];
-	int iovcnt = xlog_encode_row(row, iov);
-
-	/* TODO: use writev here */
-	for (int i = 0; i < iovcnt; i++) {
-		if (fwrite(iov[i].iov_base, iov[i].iov_len, 1, l->f) != 1) {
-			say_syserror("Can't write row (%zu bytes)",
-				     iov[i].iov_len);
-			tnt_raise(SystemError, "fwrite");
-		}
-		bytes += iov[i].iov_len;
+	ssize_t written = xlog_write_row(l, row);
+	fiber_gc();
+	if (written < 0) {
+		diag_raise();
 	}
+	bytes += written;
 
 	if (l->rows % 100000 == 0)
 		say_crit("%.1fM rows written", l->rows / 1000000.);
 
-	fiber_gc();
 
 	if (snap_io_rate_limit != UINT64_MAX) {
 		if (last == 0) {
@@ -1111,7 +729,7 @@ checkpoint_write_row(struct xlog *l, struct xrow_header *row,
 		 * not really enforced.
 		 */
 		if (bytes > snap_io_rate_limit)
-			fdatasync(fileno(l->f));
+			fdatasync(l->fd);
 	}
 	while (bytes > snap_io_rate_limit) {
 		ev_now_update(loop);
@@ -1152,8 +770,9 @@ checkpoint_write_tuple(struct xlog *l, uint32_t n, struct tuple *tuple,
 	row.bodycnt = 2;
 	row.body[0].iov_base = &body;
 	row.body[0].iov_len = sizeof(body);
-	row.body[1].iov_base = tuple->data;
-	row.body[1].iov_len = tuple->bsize;
+	uint32_t bsize;
+	row.body[1].iov_base = (char *) tuple_data_range(tuple, &bsize);
+	row.body[1].iov_len = bsize;
 	checkpoint_write_row(l, &row, snap_io_rate_limit);
 }
 
@@ -1230,23 +849,23 @@ checkpoint_f(va_list ap)
 {
 	struct checkpoint *ckpt = va_arg(ap, struct checkpoint *);
 
-	struct xlog *snap = xlog_create(&ckpt->dir, &ckpt->vclock);
+	struct xlog snap;
+	if (xdir_create_xlog(&ckpt->dir, &snap, &ckpt->vclock) != 0)
+		diag_raise();
 
-	if (snap == NULL)
-		tnt_raise(SystemError, "xlog_open");
+	auto guard = make_scoped_guard([&]{ xlog_close(&snap, false); });
 
-	auto guard = make_scoped_guard([=]{ xlog_close(snap); });
-
-	say_info("saving snapshot `%s'", snap->filename);
+	say_info("saving snapshot `%s'", snap.filename);
 	struct checkpoint_entry *entry;
 	rlist_foreach_entry(entry, &ckpt->entries, link) {
 		struct tuple *tuple;
 		struct iterator *it = entry->iterator;
 		for (tuple = it->next(it); tuple; tuple = it->next(it)) {
-			checkpoint_write_tuple(snap, space_id(entry->space),
+			checkpoint_write_tuple(&snap, space_id(entry->space),
 					       tuple, ckpt->snap_io_rate_limit);
 		}
 	}
+	xlog_flush(&snap);
 	say_info("done");
 	return 0;
 }
@@ -1281,23 +900,17 @@ MemtxEngine::waitCheckpoint(struct vclock *vclock)
 
 	/* wait for memtx-part snapshot completion */
 	int result = cord_cojoin(&m_checkpoint->cord);
-
-	struct error *e = diag_last_error(&fiber()->diag);
-	if (e != NULL) {
-		error_log(e);
-		result = -1;
-		SystemError *se = type_cast(SystemError, e);
-		if (se)
-			errno = se->get_errno();
-	}
+	if (result != 0)
+		error_log(diag_last_error(diag_get()));
 
 	m_checkpoint->waiting_for_snap_thread = false;
 	return result;
 }
 
 void
-MemtxEngine::commitCheckpoint()
+MemtxEngine::commitCheckpoint(struct vclock *vclock)
 {
+	(void) vclock;
 	/* beginCheckpoint() must have been done */
 	assert(m_checkpoint);
 	/* waitCheckpoint() must have been done. */
@@ -1310,8 +923,8 @@ MemtxEngine::commitCheckpoint()
 	/* rename snapshot on completion */
 	char to[PATH_MAX];
 	snprintf(to, sizeof(to), "%s",
-		 format_filename(dir, lsn, NONE));
-	char *from = format_filename(dir, lsn, INPROGRESS);
+		 xdir_format_filename(dir, lsn, NONE));
+	char *from = xdir_format_filename(dir, lsn, INPROGRESS);
 	int rc = coeio_rename(from, to);
 	if (rc != 0)
 		panic("can't rename .snap.inprogress");
@@ -1330,30 +943,74 @@ MemtxEngine::abortCheckpoint()
 	 */
 	if (m_checkpoint->waiting_for_snap_thread) {
 		/* wait for memtx-part snapshot completion */
-		cord_cojoin(&m_checkpoint->cord);
-
-		struct error *e = diag_last_error(&fiber()->diag);
-		if (e)
-			error_log(e);
+		if (cord_cojoin(&m_checkpoint->cord) != 0)
+			error_log(diag_last_error(diag_get()));
 		m_checkpoint->waiting_for_snap_thread = false;
 	}
 
 	tuple_end_snapshot();
 
 	/** Remove garbage .inprogress file. */
-	char *filename = format_filename(&m_checkpoint->dir,
-					 vclock_sum(&m_checkpoint->vclock),
-					 INPROGRESS);
+	char *filename =
+		xdir_format_filename(&m_checkpoint->dir,
+				     vclock_sum(&m_checkpoint->vclock),
+				     INPROGRESS);
 	(void) coeio_unlink(filename);
 
 	checkpoint_destroy(m_checkpoint);
 	m_checkpoint = 0;
 }
 
+/** Used to pass arguments to memtx_initial_join_f */
+struct memtx_join_arg {
+	const char *snap_dirname;
+	int64_t checkpoint_lsn;
+	struct xstream *stream;
+};
+
 /**
- * Invoked from relay thread to feed snapshot rows
- * to the replica, hence should not use engine state.
+ * Invoked from a thread to feed snapshot rows.
  */
+static int
+memtx_initial_join_f(va_list ap)
+{
+	struct memtx_join_arg *arg = va_arg(ap, struct memtx_join_arg *);
+	const char *snap_dirname = arg->snap_dirname;
+	int64_t checkpoint_lsn = arg->checkpoint_lsn;
+	struct xstream *stream = arg->stream;
+
+	struct xdir dir;
+	/*
+	 * snap_dirname and SERVER_UUID don't change after start,
+	 * safe to use in another thread.
+	 */
+	xdir_create(&dir, snap_dirname, SNAP, &SERVER_UUID);
+	auto guard = make_scoped_guard([&]{
+		xdir_destroy(&dir);
+	});
+	struct xlog_cursor cursor;
+	xdir_open_cursor_xc(&dir, checkpoint_lsn, &cursor);
+	auto reader_guard = make_scoped_guard([&]{
+		xlog_cursor_close(&cursor, false);
+	});
+
+	struct xrow_header row;
+	while (xlog_cursor_next_xc(&cursor, &row, true) == 0) {
+		xstream_write(stream, &row);
+	}
+
+	/**
+	 * We should never try to read snapshots with no EOF
+	 * marker - such snapshots are very likely corrupted and
+	 * should not be trusted.
+	 */
+	/* TODO: replace panic with tnt_raise() */
+	if (cursor.state != XLOG_CURSOR_EOF)
+		panic("snapshot `%s' has no EOF marker",
+		      cursor.name);
+	return 0;
+}
+
 void
 MemtxEngine::join(struct xstream *stream)
 {
@@ -1366,38 +1023,20 @@ MemtxEngine::join(struct xstream *stream)
 	if (!m_has_checkpoint)
 		tnt_raise(ClientError, ER_MISSING_SNAPSHOT);
 
-	struct xdir dir;
-	struct xlog *snap = NULL;
 	/*
-	 * snap_dirname and SERVER_UUID don't change after start,
-	 * safe to use in another thread.
+	 * cord_costart() passes only void * pointer as an argument.
 	 */
-	xdir_create(&dir, m_snap_dir.dirname, SNAP, &SERVER_UUID);
-	auto guard = make_scoped_guard([&]{
-		xdir_destroy(&dir);
-		if (snap)
-			xlog_close(snap);
-	});
-	struct vclock *last = &m_last_checkpoint;
-	snap = xlog_open_xc(&dir, vclock_sum(last));
-	struct xlog_cursor cursor;
-	xlog_cursor_open(&cursor, snap);
-	auto reader_guard = make_scoped_guard([&]{
-		xlog_cursor_close(&cursor);
-	});
+	struct memtx_join_arg arg = {
+		/* .snap_dirname   = */ m_snap_dir.dirname,
+		/* .checkpoint_lsn = */ vclock_sum(&m_last_checkpoint),
+		/* .stream         = */ stream
+	};
 
-	struct xrow_header row;
-	while (xlog_cursor_next_xc(&cursor, &row) == 0)
-		xstream_write(stream, &row);
-
-	/**
-	 * We should never try to read snapshots with no EOF
-	 * marker - such snapshots are very likely corrupted and
-	 * should not be trusted.
-	 */
-	/* TODO: replace panic with tnt_raise() */
-	if (!cursor.eof_read)
-		panic("snapshot `%s' has no EOF marker", snap->filename);
+	/* Send snapshot using a thread */
+	struct cord cord;
+	cord_costart(&cord, "initial_join", memtx_initial_join_f, &arg);
+	if (cord_cojoin(&cord) != 0)
+		diag_raise();
 }
 
 /**
@@ -1430,8 +1069,9 @@ memtx_index_arena_init()
  * Allocate a block of size MEMTX_EXTENT_SIZE for memtx index
  */
 void *
-memtx_index_extent_alloc()
+memtx_index_extent_alloc(void *ctx)
 {
+	(void)ctx;
 	if (memtx_index_reserved_extents) {
 		assert(memtx_index_num_reserved_extents > 0);
 		memtx_index_num_reserved_extents--;
@@ -1452,8 +1092,9 @@ memtx_index_extent_alloc()
  * Free a block previously allocated by memtx_index_extent_alloc
  */
 void
-memtx_index_extent_free(void *extent)
+memtx_index_extent_free(void *ctx, void *extent)
 {
+	(void)ctx;
 	return mempool_free(&memtx_index_extent_pool, extent);
 }
 

@@ -52,8 +52,6 @@ include(cmake/profile.cmake)
 include(cmake/module.cmake)
 include(cmake/thread.cmake)
 
-option(ENABLE_VALGRIND "Enable integration with valgrind, a memory analyzing tool" OFF)
-
 check_symbol_exists(MAP_ANON sys/mman.h HAVE_MAP_ANON)
 check_symbol_exists(MAP_ANONYMOUS sys/mman.h HAVE_MAP_ANONYMOUS)
 check_include_file(sys/time.h HAVE_SYS_TIME_H)
@@ -68,6 +66,7 @@ check_symbol_exists(sched_yield sched.h HAVE_SCHED_YIELD)
 check_symbol_exists(posix_fadvise fcntl.h HAVE_POSIX_FADVISE)
 check_symbol_exists(mremap sys/mman.h HAVE_MREMAP)
 
+check_function_exists(sync_file_range HAVE_SYNC_FILE_RANGE)
 check_function_exists(memmem HAVE_MEMMEM)
 check_function_exists(memrchr HAVE_MEMRCHR)
 check_function_exists(sendfile HAVE_SENDFILE)
@@ -83,15 +82,21 @@ check_function_exists(fmemopen HAVE_FMEMOPEN)
 check_function_exists(funopen HAVE_FUNOPEN)
 check_function_exists(fopencookie HAVE_FOPENCOOKIE)
 check_function_exists(uuidgen HAVE_UUIDGEN)
-#
-# clock_gettime() is not defined on Mac OS X,
-# or own (slow) implementation is in third_party/clock_gettime.c
-#
+set(CMAKE_REQUIRED_LIBRARIES "")
 if (TARGET_OS_LINUX)
-    check_library_exists(rt clock_gettime "" HAVE_CLOCK_GETTIME)
-else()
-    check_function_exists(clock_gettime HAVE_CLOCK_GETTIME)
-endif()
+    set(CMAKE_REQUIRED_LIBRARIES rt)
+endif ()
+check_symbol_exists(clock_gettime time.h HAVE_CLOCK_GETTIME_DECL)
+if (HAVE_CLOCK_GETTIME_DECL AND TARGET_OS_DARWIN)
+    # ensure clock_gettime() is declared and actually available
+    # in runtime (gh-1777)
+    check_c_source_runs(
+        "#include <time.h>\nint main() {struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return 0;}"
+        HAVE_CLOCK_GETTIME)
+else ()
+    set(HAVE_CLOCK_GETTIME ${HAVE_CLOCK_GETTIME_DECL})
+endif ()
+set(CMAKE_REQUIRED_LIBRARIES "")
 
 # Checks for libev
 include(CheckStructHasMember)
@@ -183,19 +188,21 @@ include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${PROJECT_BINARY_DIR}/src)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib/small)
+include_directories(${PROJECT_SOURCE_DIR}/src/lib/small/third_party)
 include_directories(${PROJECT_SOURCE_DIR})
 
 #
 # Specify Tarantool modules prefixes
 #
 
-set(MODULE_SUFFIX "tarantool")
-set(MODULE_LIBDIR "${CMAKE_INSTALL_LIBDIR}/${MODULE_SUFFIX}")
-set(MODULE_LUADIR "${CMAKE_INSTALL_DATADIR}/${MODULE_SUFFIX}")
-set(MODULE_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}/${MODULE_SUFFIX}")
-set(MODULE_FULL_LIBDIR "${CMAKE_INSTALL_FULL_LIBDIR}/${MODULE_SUFFIX}")
-set(MODULE_FULL_LUADIR "${CMAKE_INSTALL_FULL_DATADIR}/${MODULE_SUFFIX}")
-set(MODULE_FULL_INCLUDEDIR "${CMAKE_INSTALL_FULL_INCLUDEDIR}/${MODULE_SUFFIX}")
+set(MODULE_PRODUCT "tarantool")
+set(MODULE_LIBDIR "${CMAKE_INSTALL_LIBDIR}/${MODULE_PRODUCT}")
+set(MODULE_LUADIR "${CMAKE_INSTALL_DATADIR}/${MODULE_PRODUCT}")
+set(MODULE_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}/${MODULE_PRODUCT}")
+set(MODULE_FULL_LIBDIR "${CMAKE_INSTALL_FULL_LIBDIR}/${MODULE_PRODUCT}")
+set(MODULE_FULL_LUADIR "${CMAKE_INSTALL_FULL_DATADIR}/${MODULE_PRODUCT}")
+set(MODULE_FULL_INCLUDEDIR "${CMAKE_INSTALL_FULL_INCLUDEDIR}/${MODULE_PRODUCT}")
+set(MODULE_LIBSUFFIX "${CMAKE_SHARED_LIBRARY_SUFFIX}")
 
 install(DIRECTORY DESTINATION ${MODULE_LUADIR})
 install(DIRECTORY DESTINATION ${MODULE_LIBDIR})
@@ -213,7 +220,7 @@ list(APPEND _datadirs "/usr/share") # System packages
 list(REMOVE_DUPLICATES _datadirs)
 set(MODULE_LUAPATH)
 foreach(dir
-        "${MODULE_SUFFIX}"
+        "${MODULE_PRODUCT}"
         "lua/5.1")
     foreach(prefix IN LISTS _datadirs)
         list(APPEND MODULE_LUAPATH "${prefix}/${dir}/?.lua")
@@ -240,10 +247,10 @@ list(APPEND _libdirs "/usr/${MULTILIB}") # System packages
 list(REMOVE_DUPLICATES _libdirs)
 set(MODULE_LIBPATH)
 foreach(dir
-        "${MODULE_SUFFIX}"
+        "${MODULE_PRODUCT}"
         "lua/5.1")
     foreach(prefix IN LISTS _libdirs)
-        list(APPEND MODULE_LIBPATH "${prefix}/${dir}/?${CMAKE_SHARED_MODULE_SUFFIX}")
+        list(APPEND MODULE_LIBPATH "${prefix}/${dir}/?${MODULE_LIBSUFFIX}")
     endforeach()
 endforeach()
 
@@ -364,28 +371,6 @@ else()
 endif()
 
 #
-# LZ4
-#
-
-option(ENABLE_BUNDLED_LZ4 "Enable building of the bundled LZ4" ON)
-if (ENABLE_BUNDLED_LZ4)
-    add_library(lz4 STATIC
-        third_party/lz4/lib/lz4.c
-        third_party/lz4/lib/lz4frame.c
-        third_party/lz4/lib/lz4hc.c
-        third_party/lz4/lib/xxhash.c
-    )
-    set(LZ4_LIBRARIES lz4)
-    set(LZ4_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib)
-    find_package_message(LZ4 "Using bundled LZ4"
-        "${LZ4_LIBRARIES}:${LZ4_INCLUDE_DIRS}")
-    add_dependencies(build_bundled_libs lz4)
-else()
-    set(LZ4_FIND_REQUIRED ON)
-    find_package(LZ4)
-endif()
-
-#
 # zstd
 #
 
@@ -471,7 +456,7 @@ message (STATUS "")
 set(PREFIX ${CMAKE_INSTALL_PREFIX})
 set(options VERSION BUILD C_COMPILER CXX_COMPILER C_FLAGS CXX_FLAGS PREFIX
     ENABLE_SSE2 ENABLE_AVX
-    ENABLE_GCOV ENABLE_GPROF ENABLE_VALGRIND
+    ENABLE_GCOV ENABLE_GPROF ENABLE_VALGRIND ENABLE_ASAN
     ENABLE_BACKTRACE
     HAVE_BFD
     ENABLE_DOC

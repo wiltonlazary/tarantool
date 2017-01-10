@@ -17,9 +17,11 @@ ch:is_empty(unpack(ignored_args))
 ch:get(.1)
 ch:get(.1, nil)
 ch:get(.1, nil, unpack(ignored_args))
+tostring(ch)
 ch:put()
 ch:count()
 ch:put('test')
+tostring(ch)
 ch:get()
 ch:put('test', nil), ch:get()
 ch:put('test', nil, unpack(ignored_args)), ch:get()
@@ -108,6 +110,7 @@ ch:get()
 ch:get()
 ch:put(10)
 ch:is_closed()
+tostring(ch)
 
 ch = fiber.channel(1)
 ch:put(true)
@@ -124,42 +127,35 @@ ch:is_closed()
 
 
 -- race conditions
-chs= {}
-count= 0
-res= { }
+chs, res, count = {}, {}, 0
 test_run:cmd("setopt delimiter ';'")
 for i = 1, 10 do table.insert(chs, fiber.channel()) end;
 
-
 for i = 1, 10 do
-    local no = i fiber.create(
-        function()
-            fiber.self():name('pusher')
-            while true do
-                chs[no]:put({no})
-                fiber.sleep(0.001 * math.random())
-            end
+    fiber.create(function(no)
+        fiber.self():name('pusher')
+        while true do
+            chs[no]:put({no})
+            fiber.sleep(0.001 * math.random())
         end
-    )
+    end, i)
 end;
 
 for i = 1, 10 do
-    local no = i fiber.create(
-        function()
-            fiber.self():name('receiver')
-            while true do
-                local r = chs[no]:get(math.random() * .001)
-                if r ~= nil and r[1] == no then
-                    res[no] = true
-                elseif r ~= nil then
-                    break
-                end
-                fiber.sleep(0.001 * math.random())
-                count = count + 1
+    fiber.create(function(no)
+        fiber.self():name('receiver')
+        while true do
+            local r = chs[no]:get(math.random() * .001)
+            if r ~= nil and r[1] == no then
+                res[no] = true
+            elseif r ~= nil then
+                break
             end
-            res[no] = false
+            fiber.sleep(0.001 * math.random())
+            count = count + 1
         end
-    )
+        res[no] = false
+    end, i)
 end;
 
 for i = 1, 100 do fiber.sleep(0.01) if count > 2000 then break end end;
@@ -193,3 +189,26 @@ refs
 ch:close()
 collectgarbage('collect')
 refs -- must be zero
+
+-- fiber.cond
+c = fiber.cond()
+tostring(c)
+-- args validation
+c.wait()
+c.wait('1')
+c:wait('1')
+c:wait(-1)
+-- timeout
+c:wait(0.1)
+-- wait success
+fiber.create(function() fiber.sleep(.5); c:broadcast() end) and c:wait(.6)
+-- signal
+t = {}
+for i = 1,4 do fiber.create(function() c:wait(); table.insert(t, '#') end) end
+c:signal()
+fiber.sleep(0.1)
+t
+-- broadcast
+c:broadcast()
+fiber.sleep(0.1)
+t

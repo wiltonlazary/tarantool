@@ -185,8 +185,8 @@ bitset_index_iterator_next(struct iterator *iterator)
 #endif /* #ifndef OLD_GOOD_BITSET */
 }
 
-MemtxBitset::MemtxBitset(struct key_def *key_def)
-	: MemtxIndex(key_def)
+MemtxBitset::MemtxBitset(struct key_def *key_def_arg)
+	: MemtxIndex(key_def_arg)
 {
 	assert(!this->key_def->opts.is_unique);
 
@@ -196,7 +196,7 @@ MemtxBitset::MemtxBitset(struct key_def *key_def)
 	if (!m_id_to_tuple)
 		panic_syserror("bitset_index_create");
 	matras_create(m_id_to_tuple, MEMTX_EXTENT_SIZE, sizeof(struct tuple *),
-		      memtx_index_extent_alloc, memtx_index_extent_free);
+		      memtx_index_extent_alloc, memtx_index_extent_free, NULL);
 
 	m_tuple_to_id = mh_bitset_index_new();
 	if (!m_tuple_to_id)
@@ -406,26 +406,27 @@ MemtxBitset::count(enum iterator_type type, const char *key,
 	struct bit_iterator bit_it;
 	size_t bit;
 	if (type == ITER_BITS_ANY_SET) {
-		/*
-		 * Optimization: get the number of items for each requested bit
-		 * and then found the maximum.
-		 */
-		bit_iterator_init(&bit_it, bitset_key, bitset_key_size, true);
-		size_t result = 0;
-		while ((bit = bit_iterator_next(&bit_it)) != SIZE_MAX) {
-			size_t count = bitset_index_count(&m_index, bit);
-			result = MAX(result, count);
-		}
-		return result;
-	} else if (type == ITER_BITS_ALL_SET) {
 		/**
-		 * Optimization: for an empty key return the number of items
-		 * in the index.
+		 * Optimization: for an empty key return 0.
 		 */
 		bit_iterator_init(&bit_it, bitset_key, bitset_key_size, true);
 		bit = bit_iterator_next(&bit_it);
 		if (bit == SIZE_MAX)
-			return bitset_index_size(&m_index);
+			return 0;
+		/**
+		 * Optimiation: for a single bit key use
+		 * bitset_index_count().
+		 */
+		if (bit_iterator_next(&bit_it) == SIZE_MAX)
+			return bitset_index_count(&m_index, bit);
+	} else if (type == ITER_BITS_ALL_SET) {
+		/**
+		 * Optimization: for an empty key return 0.
+		 */
+		bit_iterator_init(&bit_it, bitset_key, bitset_key_size, true);
+		bit = bit_iterator_next(&bit_it);
+		if (bit == SIZE_MAX)
+			return 0;
 		/**
 		 * Optimiation: for a single bit key use
 		 * bitset_index_count().

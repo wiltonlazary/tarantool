@@ -1,35 +1,18 @@
-net = require('net.box')
-address  = os.getenv('ADMIN')
-box.schema.user.grant('guest', 'read,write,execute', 'universe')
-yaml = require('yaml')
 test_run = require('test_run').new()
-
+txn_proxy = require('txn_proxy')
 
 _ = box.schema.space.create('test', {engine = 'vinyl'})
 _ = box.space.test:create_index('pk')
 
-c1 = net:new(address)
-c2 = net.new(address)
-c3 = net.new(address)
-c4 = net.new(address)
-c5 = net.new(address)
-c6 = net.new(address)
-c7 = net.new(address)
+c1 = txn_proxy.new()
+c2 = txn_proxy.new()
+c3 = txn_proxy.new()
+c4 = txn_proxy.new()
+c5 = txn_proxy.new()
+c6 = txn_proxy.new()
+c7 = txn_proxy.new()
 
 
-test_run:cmd("setopt delimiter ';'")
-getmetatable(c1).__call = function(c, command)
-    local f = yaml.decode(c:console(command))
-    if type(f) == 'table' then
-        setmetatable(f, {__serialize='array'})
-    end
-    return f
-end;
-test_run:cmd("setopt delimiter ''");
-methods = getmetatable(c1)['__index']
-methods.begin = function(c) return c("box.begin()") end
-methods.commit = function(c) return c("box.commit()") end
-methods.rollback = function(c) return c("box.rollback()") end
 t = box.space.test
 
 --
@@ -533,9 +516,9 @@ c2("t:replace{1, 10}")
 --
 -- sic: commit order
 c1:commit()
-c2:commit() -- aborted by conflict @fixme it shouldn't be the case
+c2:commit() -- write after write is ok, the last writer to commit wins
 --
-c3("t:get{1}") -- {1, 15}
+c3("t:get{1}") -- {1, 10}
 --
 -- cleanup
 --
@@ -649,7 +632,7 @@ c2("t:get{200}") -- start transaction in the engine
 c2("t:replace{1, 15}")
 c1("t:replace{1, 10}")
 --
-c2:commit() -- fixme: aborted by conflict
+c2:commit()
 c1:rollback()
 --
 c3("t:get{1}")
@@ -668,10 +651,10 @@ c2("t:get{200}") -- start transaction in the engine
 c2("t:replace{1, 15}")
 c1("t:replace{1, 10}")
 --
-c2:commit() -- fixme: aborted by conflict
-c1:commit()
+c2:commit()
+c1:commit() -- ok, the last committer wins
 --
-c3("t:get{1}")
+c3("t:get{1}") -- {1, 10}
 --
 -- cleanup
 --
@@ -752,9 +735,9 @@ c2("t:replace{1, 15}")
 c1("t:replace{1, 10}")
 --
 c1:commit() -- success
-c2:commit() -- @fixme: rollback
+c2:commit() -- success, the last writer wins
 --
-c2("t:get{1}") -- {1, 10}
+c2("t:get{1}") -- {1, 15}
 --
 -- cleanup
 --
@@ -773,8 +756,8 @@ c1("t:replace{1, 10}")
 --
 c2("t:replace{1, 15}")
 --
-c2:commit() -- rollback
-c1:commit() -- success
+c2:commit() -- success
+c1:commit() -- success, the last writer wins
 --
 -- cleanup
 --
@@ -793,8 +776,8 @@ c1("t:replace{1, 10}")
 --
 c2("t:replace{1, 15}")
 --
-c2:commit() -- rollback
-c1:commit() -- succcess
+c2:commit() -- success
+c1:commit() -- success
 --
 -- cleanup
 --
@@ -813,7 +796,7 @@ c1("t:replace{1, 10}")
 --
 c2("t:replace{1, 15}")
 --
-c2:commit() -- rollback
+c2:commit() -- success
 c1:commit() -- success
 --
 -- cleanup
@@ -833,9 +816,8 @@ c1("t:replace{1, 10}")
 --
 c2("t:replace{1, 15}")
 --
-c2:commit() -- rollback
-c1:rollback()
--- c2:commit() -- success - not in tarantool
+c2:commit() -- success
+c1:commit() -- success
 --
 -- cleanup
 --
@@ -854,9 +836,8 @@ c1("t:replace{1, 10}")
 --
 c2("t:replace{1, 15}")
 --
-c2:commit() -- rollback
+c2:commit() -- success
 c1:rollback() -- success
--- c2:commit()  -- success - not in tarantool
 --
 -- cleanup
 --
@@ -875,7 +856,7 @@ c1("t:replace{1, 10}")
 --
 c2("t:replace{1, 15}")
 --
-c2:commit() -- rollback
+c2:commit() -- success
 c2:rollback() -- not in transaction
 c1:commit() -- success
 --
@@ -896,7 +877,7 @@ c1("t:replace{1, 10}")
 --
 c2("t:replace{1, 15}")
 --
-c2:commit() -- rollback
+c2:commit() -- success
 c2:rollback() -- not in transaction
 c1:commit() -- success
 --
@@ -923,12 +904,13 @@ c2("t:replace{1, 15}")
 --
 c3("t:replace{1, 20}")
 --
-c2:commit() -- rollback
-c3:commit() -- rollback
-c1:commit() -- success
+c2:commit() -- success
+c3:commit() -- success
+c1:commit() -- success, the last committer wins
 c2:commit() -- not in transaction
 c3:commit() -- not in transaction
 --
+c3:get{1} -- {1, 20}
 -- cleanup
 --
 c1("t:delete{1}")
@@ -947,14 +929,15 @@ c2("t:get{300}") -- start transaction in the engine
 --
 c1("t:replace{1, 10}")
 --
-c2("t:replace{1, 10}")
+c2("t:replace{1, 20}")
 --
-c3("t:replace{1, 10}")
+c3("t:replace{1, 30}")
 --
-c2:commit() -- rollback
-c3:commit() -- rollback
-c3:commit() -- commit
+c1:commit() -- success
+c2:commit() -- success
+c3:commit() -- success
 --
+c3("t:get{1}") -- {1, 30}
 -- cleanup
 --
 c1("t:delete{1}")
@@ -977,7 +960,7 @@ c2("t:replace{1, 15}")
 --
 c3("t:replace{1, 20}")
 --
-c2:commit() -- rollback
+c2:commit() -- success
 c3:commit() -- rollback
 c1:rollback() -- success
 --
@@ -1003,11 +986,11 @@ c2("t:replace{1, 15}")
 --
 c3("t:replace{1, 20}")
 --
-c2:commit()  -- rollback
+c2:commit()  -- success
 c3:commit() -- rollback
 c2:rollback() -- success, not in transaction in tarantool
 c3:commit() -- success, not in transaction in tarantool
-c1:commit() -- success
+c1:commit() -- rollback
 --
 -- cleanup
 --
@@ -1102,7 +1085,7 @@ c2("t:get{200}") -- start transaction in the engine
 c1("t:replace{1, 10}")
 c1:commit()
 --
-c2("t:get{1}") -- finds nothing
+c2("t:get{1}") -- find newest {1, 10}
 --
 c2("t:replace{1, 15}")
 c2:commit() -- rollback
@@ -1200,7 +1183,7 @@ c1("t:delete{1}")
 c7:begin()
 c1:begin()
 c7("t:get{100}") -- start transaction in the engine
-c1("t:get{200}") -- start transaction in the engine
+c1("t:get{1}") -- start transaction in the engine
 --
 c3:begin()
 c3("t:replace{1, 3}")
@@ -1210,9 +1193,10 @@ c2:begin()
 c3:begin()
 c2("t:get{500}") -- start transaction in the engine
 c3("t:get{600}") -- start transaction in the engine
+c2("t:get{1}") -- {1, 3}
 --
 c3("t:replace{1, 6}")
-c3:commit()
+c3:commit() -- c2 goes to read view now
 --
 c4:begin()
 c3:begin()
@@ -1235,7 +1219,7 @@ c2("t:get{1}") -- {1, 3}
 --
 c4("t:get{1}") -- {1, 12}
 --
-c5("t:get{1}") -- {1, 9}
+c5("t:get{1}") -- {1, 12}
 --
 c6("t:get{1}") -- {1, 12}
 --
@@ -1245,13 +1229,13 @@ c3:rollback()
 --
 c1("t:get{1}") -- nothing
 --
-c7("t:get{1}") -- nothing
+c7("t:get{1}") -- {1, 12}
 --
 c2:rollback()
 --
 c4("t:get{1}") -- {1, 12}
 --
-c5("t:get{1}") -- {1, 9}
+c5("t:get{1}") -- {1, 12}
 --
 c6("t:get{1}") -- {1, 12}
 --
@@ -1261,11 +1245,11 @@ c3:rollback()
 --
 c1("t:get{1}") -- nothing
 --
-c7("t:get{1}") -- nothing
+c7("t:get{1}") -- {1, 12}
 --
 c4:rollback()
 --
-c5("t:get{1}") -- {1, 9}
+c5("t:get{1}") -- {1, 12}
 --
 c6("t:get{1}") -- {1, 12}
 --
@@ -1275,7 +1259,7 @@ c3:rollback()
 --
 c1("t:get{1}") -- nothing
 --
-c7("t:get{1}") -- nothing
+c7("t:get{1}") -- {1, 12}
 --
 c5:rollback()
 --
@@ -1287,7 +1271,7 @@ c3:rollback()
 --
 c1("t:get{1}") -- nothing
 --
-c7("t:get{1}") -- nothing
+c7("t:get{1}") -- {1, 12}
 --
 c6:rollback()
 --
@@ -1295,9 +1279,9 @@ c3:begin()
 c3("t:get{1}") -- {1, 12}
 c3:rollback()
 --
-c1("t:get{1}") -- finds nothing
+c1("t:get{1}") -- nothing
 --
-c7("t:get{1}") -- finds nothing
+c7("t:get{1}") -- {1, 12}
 --
 c1:rollback()
 c7:rollback()
@@ -1344,7 +1328,7 @@ c1("t:replace{1, 10}")
 --
 -- sic: runs in autocommit mode
 --
-c2("t:replace{1, 15}") -- fixme: aborted
+c2("t:replace{1, 15}")
 --
 c1:commit()
 --
@@ -1384,7 +1368,7 @@ c1("t:insert{1, 10}")
 c2("t:insert{1, 15}")
 --
 c1:commit() -- success
-c2:commit() -- rollback
+c2:commit() -- rollback, c2 reads {1} before writing it
 --
 c3("t:get{1}") -- {1, 10}
 --
@@ -1400,10 +1384,10 @@ c1("t:insert{1, 10}")
 --
 c2("t:insert{1, 15}")
 --
-c2:commit() -- rollback
-c1:commit() -- success
+c2:commit() -- success
+c1:commit() -- rollback, c1 reads {1} before writing it
 --
-c3("t:get{1}") -- {1, 10}
+c3("t:get{1}") -- {1, 15}
 --
 --
 -- cleanup
@@ -1448,7 +1432,114 @@ t:delete{2}
 t:delete{3}
 t:delete{4}
 t:delete{5}
+-- --------------------------------------------------------------------------
+-- Conflict manager works for iterators
+-- --------------------------------------------------------------------------
+t:insert{1, 10}
+t:insert{2, 20}
+
+c1:begin()
+c2:begin()
+c1("t:select{}")
+c2("t:select{}")
+c1("t:replace{1, 'new'}")
+c2("t:replace{2, 'new'}")
+c1:commit()
+c2:commit() -- rollback
 --
+--
+-- gh-1606 visibility of changes in transaction in range queries
+--
+c1:begin()
+c1("t:select{}")
+c1("t:replace{3, 30}")
+c1("t:select{}")
+c1("t:select({3}, {iterator='ge'})")
+c1("t:select({3}, {iterator='lt'})")
+c1("t:select({3}, {iterator='gt'})")
+c1("t:select({3}, {iterator='eq'})")
+c1("t:replace{3, 'new'}")
+c1("t:select({3}, {iterator='ge'})")
+c1("t:select({3}, {iterator='lt'})")
+c1("t:select({3}, {iterator='gt'})")
+c1("t:select({3}, {iterator='eq'})")
+c1("t:delete{3}")
+c1("t:select({3}, {iterator='ge'})")
+c1("t:select({3}, {iterator='lt'})")
+c1("t:select({3}, {iterator='gt'})")
+c1("t:select({3}, {iterator='eq'})")
+c1("t:replace{3}")
+c1("t:delete{2}")
+c1("t:select({3}, {iterator='lt'})")
+c1("t:select({3}, {iterator='le'})")
+c1("t:replace{2}")
+c1("t:delete{1}")
+c1("t:select({3}, {iterator='lt'})")
+c1("t:select({3}, {iterator='le'})")
+c1("t:delete{3}")
+c1("t:select({3}, {iterator='lt'})")
+c1("t:select({3}, {iterator='le'})")
+c1:rollback()
+c1("t:select{}")
+--
+--
+-- Check that a cursor is closed automatically when a transaction
+-- is committed or rolled back
+--
+c1:begin()
+c1("t:select{1}")
+c1("for k, v in box.space.test:pairs() do box.commit() end")
+c1:rollback()
+c1:begin()
+c1("t:select{1}")
+c1("for k, v in box.space.test:pairs() do box.rollback() end")
+c1:rollback()
+t:truncate()
+
+--
+-- Check that min/max/count transactions stay within a read view
+--
+c1:begin()
+c1("t.index.pk:max()")
+c2:begin()
+c2("t:replace{1}")
+c2:commit()
+c1("t.index.pk:max()") -- nothing
+c1("t.index.pk:min()") -- nothing
+c1("t.index.pk:count()") -- 0
+c1:commit()
+--
+-- XXX bug: we read committed doata since there are no gap locks,
+-- and c1 is not turned into a read-only on conflict with c2.
+--
+c1:begin()
+c1("t.index.pk:max()") -- {1}
+c1("t.index.pk:min()") -- {1}
+c1("t.index.pk:count()") -- 1
+c2:begin()
+c2("t:replace{2}")
+c2:commit()
+c1("t.index.pk:max()") -- {2}
+c1("t.index.pk:min()") -- {1}
+c1("t.index.pk:count()") -- 2
+--
+-- Convert the reader to a read view: in this test we have
+-- an explicit conflict between c1 and c2, so c1 begins
+-- using a read view
+--
+c1:begin()
+c1("t.index.pk:max()") -- {2}
+c1("t.index.pk:min()") -- {1}
+c1("t.index.pk:count()") -- 2
+c2:begin()
+c2("t:replace{1, 'new'}") -- conflits with c1 so c1 starts using a read view
+c2("t:replace{3}")
+c2:commit()
+c1("t.index.pk:max()") -- {2}
+c1("t.index.pk:min()") -- {1}
+c1("t.index.pk:count()") -- 2
+t:truncate()
+
 -- *************************************************************************
 -- 1.7 cleanup marker: end of tests cleanup
 -- *************************************************************************
@@ -1461,4 +1552,3 @@ c4 = nil
 c5 = nil
 c6 = nil
 c7 = nil
-box.schema.user.revoke('guest', 'read,write,execute', 'universe')

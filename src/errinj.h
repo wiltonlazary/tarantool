@@ -48,9 +48,17 @@ struct errinj {
 	_(ERRINJ_WAL_IO, false) \
 	_(ERRINJ_WAL_ROTATE, false) \
 	_(ERRINJ_WAL_WRITE, false) \
+	_(ERRINJ_WAL_WRITE_PARTIAL, false) \
+	_(ERRINJ_WAL_WRITE_DISK, false) \
+	_(ERRINJ_WAL_DELAY, false) \
 	_(ERRINJ_INDEX_ALLOC, false) \
 	_(ERRINJ_TUPLE_ALLOC, false) \
 	_(ERRINJ_TUPLE_FIELD, false) \
+	_(ERRINJ_VY_RANGE_DUMP, false) \
+	_(ERRINJ_VY_RANGE_SPLIT, false) \
+	_(ERRINJ_VY_READ_PAGE, false) \
+	_(ERRINJ_VY_READ_PAGE_TIMEOUT, false) \
+	_(ERRINJ_VY_GC, false) \
 	_(ERRINJ_RELAY, false)
 
 ENUM0(errinj_enum, ERRINJ_LIST);
@@ -66,11 +74,19 @@ int errinj_foreach(errinj_cb cb, void *cb_ctx);
 
 #ifdef NDEBUG
 #  define ERROR_INJECT(ID, CODE)
+#  define ERROR_INJECT_ONCE(ID, CODE)
 #else
 #  define ERROR_INJECT(ID, CODE) \
 	do { \
 		if (errinj_get(ID) == true) \
 			CODE; \
+	} while (0)
+#  define ERROR_INJECT_ONCE(ID, CODE) \
+	do { \
+		if (errinj_get(ID) == true) { \
+			errinj_set(ID, false); \
+			CODE; \
+		} \
 	} while (0)
 #endif
 

@@ -7,19 +7,10 @@
 -- *************************************************************************
 -- 1.7 setup begins
 -- *************************************************************************
-net = require('net.box')
----
-...
-address  = os.getenv('ADMIN')
----
-...
-box.schema.user.grant('guest', 'read,write,execute', 'universe')
----
-...
-yaml = require('yaml')
----
-...
 test_run = require('test_run').new()
+---
+...
+txn_proxy = require('txn_proxy')
 ---
 ...
 _ = box.schema.space.create('test', {engine = 'vinyl'})
@@ -28,42 +19,13 @@ _ = box.schema.space.create('test', {engine = 'vinyl'})
 _ = box.space.test:create_index('pk')
 ---
 ...
-c1 = net:new(address)
+c1 = txn_proxy.new()
 ---
 ...
-c2 = net.new(address)
+c2 = txn_proxy.new()
 ---
 ...
-c3 = net.new(address)
----
-...
-test_run:cmd("setopt delimiter ';'")
----
-- true
-...
-getmetatable(c1).__call = function(c, command)
-    local f = yaml.decode(c:console(command))
-    if type(f) == 'table' then
-        setmetatable(f, {__serialize='array'})
-    end
-    return f
-end;
----
-...
-test_run:cmd("setopt delimiter ''");
----
-- true
-...
-methods = getmetatable(c1)['__index']
----
-...
-methods.begin = function(c) return c("box.begin()") end
----
-...
-methods.commit = function(c) return c("box.commit()") end
----
-...
-methods.rollback = function(c) return c("box.rollback()") end
+c3 = txn_proxy.new()
 ---
 ...
 t = box.space.test
@@ -115,17 +77,17 @@ c2("t:replace{2, 22}")
 ---
 - - [2, 22]
 ...
-c2:commit() -- rollback
+c2:commit() -- success, the last writer wins
 ---
-- - {'error': 'Transaction has been aborted by conflict'}
+- 
 ...
-t:get{1} -- {1, 11}
+t:get{1} -- {1, 12}
 ---
-- [1, 11]
+- [1, 12]
 ...
-t:get{2} -- {2, 21}
+t:get{2} -- {2, 22}
 ---
-- [2, 21]
+- [2, 22]
 ...
 -- teardown
 t:delete{1}
@@ -331,9 +293,9 @@ c1:commit() -- ok
 ---
 - 
 ...
-c2:commit() -- ok
+c2:commit() -- rollback (@fixme: not necessary)
 ---
-- 
+- - {'error': 'Transaction has been aborted by conflict'}
 ...
 -- teardown
 t:delete{1}
@@ -394,9 +356,9 @@ c3("t:get{2}") -- {2, 19}
 ---
 - - [2, 19]
 ...
-c2:commit() -- rollback -- conflict
+c2:commit() -- write only transaction - OK to commit
 ---
-- - {'error': 'Transaction has been aborted by conflict'}
+- 
 ...
 c3("t:get{2}") -- {2, 19}
 ---
@@ -406,7 +368,7 @@ c3("t:get{1}") -- {1, 11}
 ---
 - - [1, 11]
 ...
-c3:commit()
+c3:commit() -- read only transaction - OK to commit, stays with its read view
 ---
 - 
 ...
@@ -808,6 +770,10 @@ c2("t:get{2}") -- {2, 20}
 ---
 - - [2, 20]
 ...
+c2("t:get{3}") -- {3, 30} to be inserted
+---
+- - [3, 30]
+...
 c1("t:replace{3, 30}")
 ---
 - - [3, 30]
@@ -976,8 +942,5 @@ c2 = nil
 ---
 ...
 c3 = nil
----
-...
-box.schema.user.revoke('guest', 'read,write,execute', 'universe')
 ---
 ...

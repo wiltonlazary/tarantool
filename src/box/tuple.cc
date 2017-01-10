@@ -35,6 +35,7 @@
 
 #include "trivia/util.h"
 #include "fiber.h"
+#include "tt_uuid.h"
 
 uint32_t snapshot_version;
 
@@ -61,79 +62,37 @@ static struct mempool tuple_iterator_pool;
  */
 struct tuple *box_tuple_last;
 
-/*
- * Validate a new tuple format and initialize tuple-local
- * format data.
- */
-void
-tuple_init_field_map(struct tuple_format *format, struct tuple *tuple)
+int
+tuple_validate_raw(struct tuple_format *format, const char *tuple)
 {
 	if (format->field_count == 0)
-		return; /* Nothing to initialize */
-
-	const char *pos = tuple->data;
-	uint32_t *field_map = (uint32_t *) tuple;
+		return 0; /* Nothing to check */
 
 	/* Check to see if the tuple has a sufficient number of fields. */
-	uint32_t field_count = mp_decode_array(&pos);
-	if (unlikely(field_count < format->field_count))
-		tnt_raise(ClientError, ER_INDEX_FIELD_COUNT,
-			  (unsigned) field_count,
-			  (unsigned) format->field_count);
-
-	/* first field is simply accessible, so we do not store offset to it */
-	enum mp_type mp_type = mp_typeof(*pos);
-	key_mp_type_validate(format->fields[0].type, mp_type,
-			     ER_FIELD_TYPE, INDEX_OFFSET);
-	mp_next(&pos);
-	/* other fields...*/
-	for (uint32_t i = 1; i < format->field_count; i++) {
-		mp_type = mp_typeof(*pos);
-		key_mp_type_validate(format->fields[i].type, mp_type,
-				     ER_FIELD_TYPE, i + INDEX_OFFSET);
-		if (format->fields[i].offset_slot < 0)
-			field_map[format->fields[i].offset_slot] =
-				(uint32_t) (pos - tuple->data);
-		mp_next(&pos);
+	uint32_t field_count = mp_decode_array(&tuple);
+	if (format->exact_field_count > 0 &&
+	    format->exact_field_count != field_count) {
+		diag_set(ClientError, ER_EXACT_FIELD_COUNT,
+			 (unsigned) field_count,
+			 (unsigned) format->exact_field_count);
+		return -1;
 	}
-}
-
-
-/**
- * Check tuple data correspondence to space format;
- * throw proper exception if smth wrong.
- * data argument expected to be a proper msgpack array
- * Actually checks everything that checks tuple_init_field_map.
- */
-void
-tuple_validate_raw(struct tuple_format *format, const char *data)
-{
-	if (format->field_count == 0)
-		return; /* Nothing to check */
-
-	/* Check to see if the tuple has a sufficient number of fields. */
-	uint32_t field_count = mp_decode_array(&data);
-	if (unlikely(field_count < format->field_count))
-		tnt_raise(ClientError, ER_INDEX_FIELD_COUNT,
-			  (unsigned) field_count,
-			  (unsigned) format->field_count);
+	if (unlikely(field_count < format->field_count)) {
+		diag_set(ClientError, ER_INDEX_FIELD_COUNT,
+			 (unsigned) field_count,
+			 (unsigned) format->field_count);
+		return -1;
+	}
 
 	/* Check field types */
 	for (uint32_t i = 0; i < format->field_count; i++) {
-		key_mp_type_validate(format->fields[i].type, mp_typeof(*data),
-				     ER_FIELD_TYPE, i + INDEX_OFFSET);
-		mp_next(&data);
+		if (key_mp_type_validate(format->fields[i].type,
+					 mp_typeof(*tuple), ER_FIELD_TYPE,
+					 i + TUPLE_INDEX_BASE))
+			return -1;
+		mp_next(&tuple);
 	}
-}
-
-/**
- * Check tuple data correspondence to space format;
- * throw proper exception if smth wrong.
- */
-void
-tuple_validate(struct tuple_format *format, struct tuple *tuple)
-{
-	tuple_validate_raw(format, tuple->data);
+	return 0;
 }
 
 /**
@@ -145,82 +104,16 @@ tuple_validate(struct tuple_format *format, struct tuple *tuple)
  * to the snapshot file).
  */
 
-/** Allocate a tuple */
-struct tuple *
-tuple_alloc(struct tuple_format *format, size_t size)
-{
-	size_t total = sizeof(struct tuple) + size + format->field_map_size;
-	ERROR_INJECT(ERRINJ_TUPLE_ALLOC,
-		     tnt_raise(OutOfMemory, (unsigned) total,
-			       "slab allocator", "tuple"));
-	char *ptr = (char *) smalloc(&memtx_alloc, total);
-	/**
-	 * Use a nothrow version and throw an exception here,
-	 * to throw an instance of ClientError. Apart from being
-	 * more nice to the user, ClientErrors are ignored in
-	 * panic_on_wal_error=false mode, allowing us to start
-	 * with lower arena than necessary in the circumstances
-	 * of disaster recovery.
-	 */
-	if (ptr == NULL) {
-		if (total > memtx_alloc.objsize_max) {
-			tnt_raise(LoggedError, ER_SLAB_ALLOC_MAX,
-				  (unsigned) total);
-		} else {
-			tnt_raise(OutOfMemory, (unsigned) total,
-				  "slab allocator", "tuple");
-		}
-	}
-	struct tuple *tuple = (struct tuple *)(ptr + format->field_map_size);
-
-	tuple->refs = 0;
-	tuple->version = snapshot_version;
-	tuple->bsize = size;
-	tuple->format_id = tuple_format_id(format);
-	tuple_format_ref(format, 1);
-
-	say_debug("tuple_alloc(%zu) = %p", size, tuple);
-	return tuple;
-}
-
-/**
- * Free the tuple.
- * @pre tuple->refs  == 0
- */
-void
-tuple_delete(struct tuple *tuple)
-{
-	say_debug("tuple_delete(%p)", tuple);
-	assert(tuple->refs == 0);
-	struct tuple_format *format = tuple_format(tuple);
-	size_t total = sizeof(struct tuple) + tuple->bsize + format->field_map_size;
-	char *ptr = (char *) tuple - format->field_map_size;
-	tuple_format_ref(format, -1);
-	if (!memtx_alloc.is_delayed_free_mode || tuple->version == snapshot_version)
-		smfree(&memtx_alloc, ptr, total);
-	else
-		smfree_delayed(&memtx_alloc, ptr, total);
-}
-
-/**
- * Throw and exception about tuple reference counter overflow.
- */
-void
-tuple_ref_exception()
-{
-	tnt_raise(ClientError, ER_TUPLE_REF_OVERFLOW);
-}
-
 const char *
-tuple_seek(struct tuple_iterator *it, uint32_t i)
+tuple_seek(struct tuple_iterator *it, uint32_t fieldno)
 {
-	const char *field = tuple_field(it->tuple, i);
+	const char *field = tuple_field(it->tuple, fieldno);
 	if (likely(field != NULL)) {
 		it->pos = field;
-		it->fieldno = i;
+		it->fieldno = fieldno;
 		return tuple_next(it);
 	} else {
-		it->pos = it->tuple->data + it->tuple->bsize;
+		it->pos = it->end;
 		it->fieldno = tuple_field_count(it->tuple);
 		return NULL;
 	}
@@ -229,11 +122,10 @@ tuple_seek(struct tuple_iterator *it, uint32_t i)
 const char *
 tuple_next(struct tuple_iterator *it)
 {
-	const char *tuple_end = it->tuple->data + it->tuple->bsize;
-	if (it->pos < tuple_end) {
+	if (it->pos < it->end) {
 		const char *field = it->pos;
 		mp_next(&it->pos);
-		assert(it->pos <= tuple_end);
+		assert(it->pos <= it->end);
 		it->fieldno++;
 		return field;
 	}
@@ -246,12 +138,8 @@ tuple_next_u32(struct tuple_iterator *it);
 const char *
 tuple_field_to_cstr(const char *field, uint32_t len)
 {
-	enum { MAX_STR_BUFS = 4, MAX_BUF_LEN = 256 };
-	static __thread char bufs[MAX_STR_BUFS][MAX_BUF_LEN];
-	static __thread unsigned i = 0;
-	char *buf = bufs[i];
-	i = (i + 1) % MAX_STR_BUFS;
-	len = MIN(len, MAX_BUF_LEN - 1);
+	char *buf = tt_static_buf();
+	len = MIN(len, TT_STATIC_BUF_LEN - 1);
 	memcpy(buf, field, len);
 	buf[len] = '\0';
 	return buf;
@@ -260,52 +148,49 @@ tuple_field_to_cstr(const char *field, uint32_t len)
 const char *
 tuple_next_cstr(struct tuple_iterator *it)
 {
-	uint32_t fieldno = it->fieldno;
-	const char *field = tuple_next(it);
-	if (field == NULL)
-		tnt_raise(ClientError, ER_NO_SUCH_FIELD, fieldno);
-	if (mp_typeof(*field) != MP_STR)
-		tnt_raise(ClientError, ER_FIELD_TYPE, fieldno + INDEX_OFFSET,
-			  field_type_strs[STRING]);
+	const char *field = tuple_next_check(it, MP_STR);
 	uint32_t len = 0;
 	const char *str = mp_decode_str(&field, &len);
 	return tuple_field_to_cstr(str, len);
 }
 
-extern inline const char *
-tuple_field(const struct tuple *tuple, uint32_t i);
-
-extern inline uint32_t
-tuple_field_u32(struct tuple *tuple, uint32_t i);
-
 const char *
-tuple_field_cstr(struct tuple *tuple, uint32_t i)
+tuple_field_cstr(struct tuple *tuple, uint32_t fieldno)
 {
-	const char *field = tuple_field(tuple, i);
-	if (field == NULL)
-		tnt_raise(ClientError, ER_NO_SUCH_FIELD, i);
-	if (mp_typeof(*field) != MP_STR)
-		tnt_raise(ClientError, ER_FIELD_TYPE, i + INDEX_OFFSET,
-			  field_type_strs[STRING]);
+	const char *field = tuple_field_check(tuple, fieldno, MP_STR);
 	uint32_t len = 0;
 	const char *str = mp_decode_str(&field, &len);
 	return tuple_field_to_cstr(str, len);
+}
+
+void
+tuple_field_uuid(struct tuple *tuple, int fieldno, struct tt_uuid *result)
+{
+	const char *value = tuple_field_cstr(tuple, fieldno);
+	if (tt_uuid_from_string(value, result) != 0)
+		tnt_raise(ClientError, ER_INVALID_UUID, value);
 }
 
 char *
-tuple_extract_key(const struct tuple *tuple, struct key_def *key_def,
+tuple_extract_key(const struct tuple *tuple, const struct key_def *key_def,
 		  uint32_t *key_size)
 {
-	return tuple_extract_key_raw(tuple->data, tuple->data + tuple->bsize,
-				     key_def, key_size);
+	uint32_t bsize;
+	const char *data = tuple_data_range(tuple, &bsize);
+	return tuple_extract_key_raw(data, data + bsize, key_def, key_size);
 }
 
 char *
 tuple_extract_key_raw(const char *data, const char *data_end,
-		      struct key_def *key_def, uint32_t *key_size)
+		      const struct key_def *key_def, uint32_t *key_size)
 {
 	/* allocate buffer with maximal possible size */
-	char *key = (char *) region_alloc_xc(&fiber()->gc, data_end - data);
+	char *key = (char *) region_alloc(&fiber()->gc, data_end - data);
+	if (key == NULL) {
+		diag_set(OutOfMemory, data_end - data, "region",
+			 "tuple_extract_key_raw");
+		return NULL;
+	}
 	char *key_buf = mp_encode_array(key, key_def->part_count);
 	const char *field0 = data;
 	mp_decode_array(&field0);
@@ -313,19 +198,19 @@ tuple_extract_key_raw(const char *data, const char *data_end,
 	mp_next(&field0_end);
 	const char *field = field0;
 	const char *field_end = field0_end;
-	uint32_t current_field_no = 0;
+	uint32_t current_fieldno = 0;
 	for (uint32_t i = 0; i < key_def->part_count; i++) {
-		uint32_t field_no = key_def->parts[i].fieldno;
-		if (field_no < current_field_no) {
+		uint32_t fieldno = key_def->parts[i].fieldno;
+		if (fieldno < current_fieldno) {
 			/* Rewind. */
 			field = field0;
 			field_end = field0_end;
-			current_field_no = 0;
+			current_fieldno = 0;
 		}
-		while (current_field_no < field_no) {
+		while (current_fieldno < fieldno) {
 			field = field_end;
 			mp_next(&field_end);
-			current_field_no++;
+			current_fieldno++;
 		}
 		memcpy(key_buf, field, field_end - field);
 		key_buf += field_end - field;
@@ -340,18 +225,19 @@ struct tuple *
 tuple_update(struct tuple_format *format,
 	     tuple_update_alloc_func f, void *alloc_ctx,
 	     const struct tuple *old_tuple, const char *expr,
-	     const char *expr_end, int field_base)
+	     const char *expr_end, int field_base, uint64_t *column_mask)
 {
-	uint32_t new_size = 0;
+	uint32_t new_size = 0, bsize;
+	const char *old_data = tuple_data_range(old_tuple, &bsize);
 	const char *new_data =
 		tuple_update_execute(f, alloc_ctx,
-				     expr, expr_end, old_tuple->data,
-				     old_tuple->data + old_tuple->bsize,
-				     &new_size, field_base);
+				     expr, expr_end, old_data, old_data + bsize,
+				     &new_size, field_base, column_mask);
 	if (new_data == NULL)
 		diag_raise();
 
-	return tuple_new(format, new_data, new_data + new_size);
+	struct tuple *ret = tuple_new_xc(format, new_data, new_data + new_size);
+	return ret;
 }
 
 struct tuple *
@@ -360,290 +246,17 @@ tuple_upsert(struct tuple_format *format,
 	     const struct tuple *old_tuple,
 	     const char *expr, const char *expr_end, int field_base)
 {
-	uint32_t new_size = 0;
+	uint32_t new_size = 0, bsize;
+	const char *old_data = tuple_data_range(old_tuple, &bsize);
 	const char *new_data =
 		tuple_upsert_execute(region_alloc, alloc_ctx, expr, expr_end,
-				     old_tuple->data,
-				     old_tuple->data + old_tuple->bsize,
-				     &new_size, field_base);
+				     old_data, old_data + bsize,
+				     &new_size, field_base, false, NULL);
 	if (new_data == NULL)
 		diag_raise();
 
-	return tuple_new(format, new_data, new_data + new_size);
-}
-
-struct tuple *
-tuple_new(struct tuple_format *format, const char *data, const char *end)
-{
-	size_t tuple_len = end - data;
-	assert(mp_typeof(*data) == MP_ARRAY);
-	struct tuple *new_tuple = tuple_alloc(format, tuple_len);
-	memcpy(new_tuple->data, data, tuple_len);
-	try {
-		tuple_init_field_map(format, new_tuple);
-	} catch (Exception *e) {
-		tuple_delete(new_tuple);
-		throw;
-	}
-	return new_tuple;
-}
-
-/*
- * Compare two tuple fields.
- * Separate version exists since compare is a very
- * often used operation, so any performance speed up
- * in it can have dramatic impact on the overall
- * server performance.
- */
-inline __attribute__((always_inline)) int
-mp_compare_uint(const char **data_a, const char **data_b);
-
-enum mp_class {
-	MP_CLASS_NIL = 0,
-	MP_CLASS_BOOL,
-	MP_CLASS_NUMBER,
-	MP_CLASS_STR,
-	MP_CLASS_BIN,
-	MP_CLASS_ARRAY,
-	MP_CLASS_MAP
-};
-
-static enum mp_class mp_classes[] = {
-	/* .MP_NIL     = */ MP_CLASS_NIL,
-	/* .MP_UINT    = */ MP_CLASS_NUMBER,
-	/* .MP_INT     = */ MP_CLASS_NUMBER,
-	/* .MP_STR     = */ MP_CLASS_STR,
-	/* .MP_BIN     = */ MP_CLASS_BIN,
-	/* .MP_ARRAY   = */ MP_CLASS_ARRAY,
-	/* .MP_MAP     = */ MP_CLASS_MAP,
-	/* .MP_BOOL    = */ MP_CLASS_BOOL,
-	/* .MP_FLOAT   = */ MP_CLASS_NUMBER,
-	/* .MP_DOUBLE  = */ MP_CLASS_NUMBER,
-	/* .MP_BIN     = */ MP_CLASS_BIN
-};
-
-#define COMPARE_RESULT(a, b) (a < b ? -1 : a > b)
-
-static enum mp_class
-mp_classof(enum mp_type type)
-{
-	return mp_classes[type];
-}
-
-static inline double
-mp_decode_number(const char **data)
-{
-	double val;
-	switch (mp_typeof(**data)) {
-	case MP_UINT:
-		val = mp_decode_uint(data);
-		break;
-	case MP_INT:
-		val = mp_decode_int(data);
-		break;
-	case MP_FLOAT:
-		val = mp_decode_float(data);
-		break;
-	case MP_DOUBLE:
-		val = mp_decode_double(data);
-		break;
-	default:
-		unreachable();
-	}
-	return val;
-}
-
-static int
-mp_compare_bool(const char *field_a, const char *field_b)
-{
-	int a_val = mp_decode_bool(&field_a);
-	int b_val = mp_decode_bool(&field_b);
-	return COMPARE_RESULT(a_val, b_val);
-}
-
-static int
-mp_compare_integer(const char *field_a, const char *field_b)
-{
-	enum mp_type a_type = mp_typeof(*field_a);
-	enum mp_type b_type = mp_typeof(*field_b);
-	assert(mp_classof(a_type) == MP_CLASS_NUMBER);
-	assert(mp_classof(b_type) == MP_CLASS_NUMBER);
-	if (a_type == MP_UINT) {
-		uint64_t a_val = mp_decode_uint(&field_a);
-		if (b_type == MP_UINT) {
-			uint64_t b_val = mp_decode_uint(&field_b);
-			return COMPARE_RESULT(a_val, b_val);
-		} else {
-			int64_t b_val = mp_decode_int(&field_b);
-			if (b_val < 0)
-				return 1;
-			return COMPARE_RESULT(a_val, (uint64_t)b_val);
-		}
-	} else {
-		int64_t a_val = mp_decode_int(&field_a);
-		if (b_type == MP_UINT) {
-			uint64_t b_val = mp_decode_uint(&field_b);
-			if (a_val < 0)
-				return -1;
-			return COMPARE_RESULT((uint64_t)a_val, b_val);
-		} else {
-			int64_t b_val = mp_decode_int(&field_b);
-			return COMPARE_RESULT(a_val, b_val);
-		}
-	}
-}
-
-static int
-mp_compare_number(const char *field_a, const char *field_b)
-{
-	enum mp_type a_type = mp_typeof(*field_a);
-	enum mp_type b_type = mp_typeof(*field_b);
-	assert(mp_classof(a_type) == MP_CLASS_NUMBER);
-	assert(mp_classof(b_type) == MP_CLASS_NUMBER);
-	if (a_type == MP_FLOAT || a_type == MP_DOUBLE ||
-	    b_type == MP_FLOAT || b_type == MP_DOUBLE) {
-		double a_val = mp_decode_number(&field_a);
-		double b_val = mp_decode_number(&field_b);
-		return COMPARE_RESULT(a_val, b_val);
-	}
-	return mp_compare_integer(field_a, field_b);
-}
-
-static inline int
-mp_compare_str(const char *field_a, const char *field_b)
-{
-	uint32_t size_a = mp_decode_strl(&field_a);
-	uint32_t size_b = mp_decode_strl(&field_b);
-	int r = memcmp(field_a, field_b, MIN(size_a, size_b));
-	if (r != 0)
-		return r;
-	return COMPARE_RESULT(size_a, size_b);
-}
-
-static inline int
-mp_compare_bin(const char *field_a, const char *field_b)
-{
-	uint32_t size_a = mp_decode_binl(&field_a);
-	uint32_t size_b = mp_decode_binl(&field_b);
-	int r = memcmp(field_a, field_b, MIN(size_a, size_b));
-	if (r != 0)
-		return r;
-	return COMPARE_RESULT(size_a, size_b);
-}
-
-typedef int (*mp_compare_f)(const char *, const char *);
-static mp_compare_f mp_class_comparators[] = {
-	/* .MP_CLASS_NIL    = */ NULL,
-	/* .MP_CLASS_BOOL   = */ mp_compare_bool,
-	/* .MP_CLASS_NUMBER = */ mp_compare_number,
-	/* .MP_CLASS_STR    = */ mp_compare_str,
-	/* .MP_CLASS_BIN    = */ mp_compare_bin,
-	/* .MP_CLASS_ARRAY  = */ NULL,
-	/* .MP_CLASS_MAP    = */ NULL,
-};
-
-static int
-mp_compare_scalar(const char *field_a, const char *field_b)
-{
-	enum mp_type a_type = mp_typeof(*field_a);
-	enum mp_type b_type = mp_typeof(*field_b);
-	enum mp_class a_class = mp_classof(a_type);
-	enum mp_class b_class = mp_classof(b_type);
-	if (a_class != b_class)
-		return COMPARE_RESULT(a_class, b_class);
-	mp_compare_f cmp = mp_class_comparators[a_class];
-	assert(cmp != NULL);
-	return cmp(field_a, field_b);
-}
-
-int
-tuple_compare_field(const char *field_a, const char *field_b,
-		    enum field_type type)
-{
-	switch (type) {
-	case NUM:
-		return mp_compare_uint(field_a, field_b);
-	case STRING:
-		return mp_compare_str(field_a, field_b);
-	case INT:
-		return mp_compare_integer(field_a, field_b);
-	case NUMBER:
-		return mp_compare_number(field_a, field_b);
-	case SCALAR:
-		return mp_compare_scalar(field_a, field_b);
-	default:
-		unreachable();
-		return 0;
-	}
-}
-
-int
-tuple_compare_default(const struct tuple *tuple_a, const struct tuple *tuple_b,
-	      const struct key_def *key_def)
-{
-	if (key_def->part_count == 1 && key_def->parts[0].fieldno == 0) {
-		const char *a = tuple_a->data;
-		const char *b = tuple_b->data;
-		mp_decode_array(&a);
-		mp_decode_array(&b);
-		return tuple_compare_field(a, b, key_def->parts[0].type);
-	}
-
-	const struct key_part *part = key_def->parts;
-	const struct key_part *end = part + key_def->part_count;
-	struct tuple_format *format_a = tuple_format(tuple_a);
-	struct tuple_format *format_b = tuple_format(tuple_b);
-	const char *field_a;
-	const char *field_b;
-	int r = 0;
-
-	for (; part < end; part++) {
-		field_a = tuple_field_old(format_a, tuple_a, part->fieldno);
-		field_b = tuple_field_old(format_b, tuple_b, part->fieldno);
-		assert(field_a != NULL && field_b != NULL);
-		if ((r = tuple_compare_field(field_a, field_b, part->type)))
-			break;
-	}
-	return r;
-}
-
-int
-tuple_compare_dup(const struct tuple *tuple_a, const struct tuple *tuple_b,
-		  const struct key_def *key_def)
-{
-	int r = key_def->tuple_compare(tuple_a, tuple_b, key_def);
-	if (r == 0)
-		r = tuple_a < tuple_b ? -1 : tuple_a > tuple_b;
-
-	return r;
-}
-
-int
-tuple_compare_with_key_default(const struct tuple *tuple, const char *key,
-		       uint32_t part_count, const struct key_def *key_def)
-{
-	assert(key != NULL || part_count == 0);
-	assert(part_count <= key_def->part_count);
-	struct tuple_format *format = tuple_format(tuple);
-	if (likely(part_count == 1)) {
-		const struct key_part *part = key_def->parts;
-		const char *field = tuple_field_old(format, tuple,
-						    part->fieldno);
-		return tuple_compare_field(field, key, part->type);
-	}
-
-	const struct key_part *part = key_def->parts;
-	const struct key_part *end = part + MIN(part_count, key_def->part_count);
-	int r = 0; /* Part count can be 0 in wildcard searches. */
-	for (; part < end; part++) {
-		const char *field = tuple_field_old(format, tuple,
-						    part->fieldno);
-		r = tuple_compare_field(field, key, part->type);
-		if (r != 0)
-			break;
-		mp_next(&key);
-	}
-	return r;
+	struct tuple *ret = tuple_new_xc(format, new_data, new_data + new_size);
+	return ret;
 }
 
 void
@@ -663,8 +276,13 @@ tuple_init(float tuple_arena_max_size, uint32_t objsize_min,
 	if (slab_size < SLAB_SIZE_MIN)
 		slab_size = SLAB_SIZE_MIN;
 
+	/*
+	 * Ensure that quota is a multiple of slab_size, to
+	 * have accurate value of quota_used_ratio
+	 */
+	size_t prealloc = small_align(tuple_arena_max_size * 1024
+				      * 1024 * 1024, slab_size);
 	/** Preallocate entire quota. */
-	size_t prealloc = tuple_arena_max_size * 1024 * 1024 * 1024;
 	quota_init(&memtx_quota, prealloc);
 
 	say_info("mapping %zu bytes for tuple arena...", prealloc);
@@ -726,11 +344,11 @@ box_tuple_format_default(void)
 box_tuple_t *
 box_tuple_new(box_tuple_format_t *format, const char *data, const char *end)
 {
-	try {
-		return tuple_bless(tuple_new(format, data, end));
-	} catch (Exception *e) {
+	struct tuple *ret = tuple_new(format, data, end);
+	if (ret == NULL)
 		return NULL;
-	}
+	/* Can't throw on zero refs. */
+	return tuple_bless(ret);
 }
 
 int
@@ -781,10 +399,10 @@ box_tuple_format(const box_tuple_t *tuple)
 }
 
 const char *
-box_tuple_field(const box_tuple_t *tuple, uint32_t i)
+box_tuple_field(const box_tuple_t *tuple, uint32_t fieldno)
 {
 	assert(tuple != NULL);
-	return tuple_field(tuple, i);
+	return tuple_field(tuple, fieldno);
 }
 
 typedef struct tuple_iterator box_tuple_iterator_t;
@@ -825,9 +443,9 @@ box_tuple_rewind(box_tuple_iterator_t *it)
 }
 
 const char *
-box_tuple_seek(box_tuple_iterator_t *it, uint32_t field_no)
+box_tuple_seek(box_tuple_iterator_t *it, uint32_t fieldno)
 {
-	return tuple_seek(it, field_no);
+	return tuple_seek(it, fieldno);
 }
 
 const char *
@@ -843,7 +461,7 @@ box_tuple_update(const box_tuple_t *tuple, const char *expr, const char *expr_en
 		RegionGuard region_guard(&fiber()->gc);
 		struct tuple *new_tuple = tuple_update(tuple_format_default,
 			region_aligned_alloc_xc_cb, &fiber()->gc, tuple,
-			expr, expr_end, 1);
+			expr, expr_end, 1, NULL);
 		return tuple_bless(new_tuple);
 	} catch (ClientError *e) {
 		return NULL;

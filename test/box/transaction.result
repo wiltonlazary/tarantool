@@ -298,16 +298,14 @@ box.schema.func.create('test')
 box.schema.user.grant('guest', 'execute', 'function', 'test')
 ---
 ...
-cn = require('net.box').new(box.cfg.listen)
+cn = require('net.box').connect(box.cfg.listen)
 ---
 ...
 cn:call('test') -- first CALL starts transaction
 ---
-- []
 ...
 cn:call('test') -- iproto reuses fiber on the second call
 ---
-- []
 ...
 cn = nil
 ---
@@ -412,5 +410,16 @@ box.space.test:len()
 - 10001
 ...
 box.space.test:drop()
+---
+...
+--
+-- gh-1638: box.rollback on a JIT-ed code path crashes LuaJIT
+-- (ffi call + yield don't mix well, rollback started to yield recently)
+-- Note: don't remove gh_1638(), it's necessary to trigger JIT-compilation.
+--
+function gh_1638() box.begin(); box.rollback() end
+---
+...
+for i = 1, 1000 do fiber.create(function() gh_1638() end) end
 ---
 ...

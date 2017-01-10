@@ -61,6 +61,7 @@
 #include "tt_pthread.h"
 #include "lua/init.h"
 #include "box/box.h"
+#include "box/error.h"
 #include "scoped_guard.h"
 #include "random.h"
 #include "tt_uuid.h"
@@ -69,7 +70,6 @@
 #include "cfg.h"
 #include "version.h"
 #include <readline/readline.h>
-#include <readline/history.h>
 #include "title.h"
 #include <libutil.h>
 #include "box/lua/init.h" /* box_lua_init() */
@@ -471,11 +471,6 @@ tarantool_free(void)
 
 	box_free();
 
-	if (history) {
-		write_history(history);
-		clear_history();
-		free(history);
-	}
 	title_free(main_argc, main_argv);
 
 	/* unlink pidfile. */
@@ -486,13 +481,6 @@ tarantool_free(void)
 #ifdef ENABLE_GCOV
 	__gcov_flush();
 #endif
-	/* A hack for cc/ld, see ffisyms.c */
-	if (time(NULL) == 0) {
-		/* never executed */
-		extern void *ffi_symbols[];
-		ssize_t res = write(0, ffi_symbols, 0);
-		(void) res;
-	}
 	if (script)
 		free(script);
 	/* tarantool_lua_free() was formerly reponsible for terminal reset,
@@ -605,17 +593,9 @@ main(int argc, char **argv)
 		argc--;
 		script = abspath(argv[0]);
 		title_set_script_name(argv[0]);
-	} else if (isatty(STDIN_FILENO)) {
-		/* load history file */
-		char *home = getenv("HOME");
-		history = (char *) malloc(PATH_MAX);
-		snprintf(history, PATH_MAX, "%s/%s", home,
-			 ".tarantool_history");
-		read_history(history);
 	}
 
 	random_init();
-	say_init(argv[0]);
 
 	crc32_init();
 	memory_init();
@@ -624,6 +604,7 @@ main(int argc, char **argv)
 	main_argv = argv;
 
 	exception_init();
+	box_error_init();
 
 	fiber_init(fiber_cxx_invoke);
 	/* Init iobuf library with default readahead */

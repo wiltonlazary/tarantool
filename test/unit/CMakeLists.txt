@@ -8,10 +8,11 @@ set_source_files_compile_flags(${all_sources})
 include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${PROJECT_BINARY_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/third_party)
+add_executable(heap.test heap.c unit.c)
+add_executable(heap_iterator.test heap_iterator.c unit.c)
 add_executable(rlist.test rlist.c unit.c)
 add_executable(stailq.test stailq.c unit.c)
 add_executable(uri.test uri.c unit.c ${CMAKE_SOURCE_DIR}/src/uri.c)
-add_executable(fiob.test unit.c fiob.c ${CMAKE_SOURCE_DIR}/src/fiob.c)
 add_executable(queue.test queue.c)
 add_executable(mhash.test mhash.c)
 add_executable(mhash_bytemap.test mhash_bytemap.c)
@@ -30,14 +31,19 @@ add_executable(bitset_index.test bitset_index.c)
 target_link_libraries(bitset_index.test bitset)
 add_executable(base64.test base64.c ${CMAKE_SOURCE_DIR}/third_party/base64.c)
 
+add_executable(uuid.test uuid.c unit.c
+        ${CMAKE_SOURCE_DIR}/src/tt_uuid.c
+        ${CMAKE_SOURCE_DIR}/src/random.c)
+target_link_libraries(uuid.test bit)
+
 add_executable(bps_tree.test bps_tree.cc)
 target_link_libraries(bps_tree.test small misc)
-add_executable(bps_tree_itr.test bps_tree_itr.cc)
-target_link_libraries(bps_tree_itr.test small misc)
+add_executable(bps_tree_iterator.test bps_tree_iterator.cc)
+target_link_libraries(bps_tree_iterator.test small misc)
 add_executable(rtree.test rtree.cc)
 target_link_libraries(rtree.test salad small)
-add_executable(rtree_itr.test rtree_itr.cc)
-target_link_libraries(rtree_itr.test salad small)
+add_executable(rtree_iterator.test rtree_iterator.cc)
+target_link_libraries(rtree_iterator.test salad small)
 add_executable(rtree_multidim.test rtree_multidim.cc)
 target_link_libraries(rtree_multidim.test salad small)
 add_executable(light.test light.cc)
@@ -46,7 +52,8 @@ add_executable(vclock.test vclock.cc unit.c
     ${CMAKE_SOURCE_DIR}/src/box/vclock.c
     ${CMAKE_SOURCE_DIR}/src/box/errcode.c
     ${CMAKE_SOURCE_DIR}/src/box/error.cc
-    ${CMAKE_SOURCE_DIR}/src/rmean.c)
+    ${CMAKE_SOURCE_DIR}/src/rmean.c
+    ${CMAKE_SOURCE_DIR}/src/histogram.c)
 target_link_libraries(vclock.test core salad small)
 add_executable(xrow.test xrow.cc unit.c
     ${CMAKE_SOURCE_DIR}/src/box/xrow.cc
@@ -116,6 +123,10 @@ add_executable(csv.test csv.c
 add_executable(rmean.test rmean.cc unit.c
         ${CMAKE_SOURCE_DIR}/src/rmean.c)
 target_link_libraries(rmean.test core)
+
+add_executable(histogram.test histogram.c unit.c
+        ${CMAKE_SOURCE_DIR}/src/histogram.c)
+target_link_libraries(histogram.test core)
 
 add_executable(say.test say.c unit.c)
 target_link_libraries(say.test core)

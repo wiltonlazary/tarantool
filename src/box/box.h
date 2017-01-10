@@ -82,6 +82,9 @@ int box_snapshot(void);
  */
 const char *box_status(void);
 
+#if defined(__cplusplus)
+} /* extern "C" */
+
 void
 box_process_auth(struct request *request, struct obuf *out);
 
@@ -104,7 +107,8 @@ box_process_subscribe(struct ev_io *io, struct xrow_header *header);
 void
 box_check_config();
 
-void box_set_listen(void);
+void box_bind(void);
+void box_listen(void);
 void box_set_replication_source(void);
 void box_set_log_level(void);
 void box_set_io_collect_interval(void);
@@ -113,8 +117,7 @@ void box_set_too_long_threshold(void);
 void box_set_readahead(void);
 void box_set_panic_on_wal_error(void);
 
-#if defined(__cplusplus)
-}
+extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct box_function_ctx {
@@ -232,9 +235,9 @@ box_delete(uint32_t space_id, uint32_t index_id, const char *key,
  * \param key encoded key in MsgPack Array format ([part1, part2, ...]).
  * \param key_end the end of encoded \a key.
  * \param ops encoded operations in MsgPack Arrat format, e.g.
- * [ [ '=', field_id,  value ],  ['!', 2, 'xxx'] ]
+ * [ [ '=', fieldno,  value ],  ['!', 2, 'xxx'] ]
  * \param ops_end the end of encoded \a ops
- * \param index_base 0 if field_ids in update operations are zero-based
+ * \param index_base 0 if fieldnos in update operations are zero-based
  * indexed (like C) or 1 if for one-based indexed field ids (like Lua).
  * \param[out] result a new tuple. Can be set to NULL to discard result.
  * \retval -1 on error (check box_error_last())
@@ -253,11 +256,11 @@ box_update(uint32_t space_id, uint32_t index_id, const char *key,
  * \param space_id space identifier
  * \param index_id index identifier
  * \param ops encoded operations in MsgPack Arrat format, e.g.
- * [ [ '=', field_id,  value ],  ['!', 2, 'xxx'] ]
+ * [ [ '=', fieldno,  value ],  ['!', 2, 'xxx'] ]
  * \param ops_end the end of encoded \a ops
  * \param tuple encoded tuple in MsgPack Array format ([ field1, field2, ...])
  * \param tuple_end end of @a tuple
- * \param index_base 0 if field_ids in update operations are zero-based
+ * \param index_base 0 if fieldnos in update operations are zero-based
  * indexed (like C) or 1 if for one-based indexed field ids (like Lua).
  * \param[out] result a new tuple. Can be set to NULL to discard result.
  * \retval -1 on error (check box_error_last())
@@ -289,5 +292,12 @@ box_truncate(uint32_t space_id);
  */
 int
 box_process1(struct request *request, box_tuple_t **result);
+
+int
+boxk(int type, uint32_t space_id, const char *format, ...);
+
+#if defined(__cplusplus)
+} /* extern "C" */
+#endif /* defined(__cplusplus) */
 
 #endif /* INCLUDES_TARANTOOL_BOX_H */

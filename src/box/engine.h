@@ -35,21 +35,21 @@
 struct request;
 struct space;
 struct tuple;
+struct tuple_format_vtab;
 struct relay;
 
 enum engine_flags {
 	ENGINE_CAN_BE_TEMPORARY = 1,
-	ENGINE_AUTO_CHECK_UPDATE = 2,
 };
 
 extern struct rlist engines;
 
-class Handler;
+struct Handler;
 
 /** Engine instance */
 class Engine {
 public:
-	Engine(const char *engine_name);
+	Engine(const char *engine_name, struct tuple_format_vtab *format);
 
 	Engine(const Engine &) = delete;
 	Engine& operator=(const Engine&) = delete;
@@ -58,11 +58,6 @@ public:
 	virtual void init();
 	/** Create a new engine instance for a space. */
 	virtual Handler *open() = 0;
-	/**
-	 * Create an instance of space index. Used in alter
-	 * space.
-	 */
-	virtual Index *createIndex(struct key_def*) = 0;
 	virtual void initSystemSpace(struct space *space);
 	/**
 	 * Check a key definition for violation of
@@ -76,22 +71,20 @@ public:
 	 */
 	virtual void addPrimaryKey(struct space *space);
 	/**
-	 * Delete all tuples in the index on drop.
-	 */
-	virtual void dropIndex(Index *);
-	/**
 	 * Called by alter when the primary key is dropped.
 	 * Do whatever is necessary with space/handler object,
 	 * e.g. disable handler replace function, if
 	 * necessary.
 	 */
 	virtual void dropPrimaryKey(struct space *space);
+
 	/**
-	 * An optimization for MemTX engine, which
-	 * builds all secondary keys after recovery from
-	 * a snapshot.
+	 * Called with the new empty secondary index. Fill the new index
+	 * with data from the primary key of the space.
 	 */
-	virtual bool needToBuildSecondaryKey(struct space *space);
+	virtual void buildSecondaryKey(struct space *old_space,
+				       struct space *new_space,
+				       Index *new_index);
 
 	virtual void join(struct xstream *);
 	/**
@@ -102,6 +95,10 @@ public:
 	 * statement.
 	 */
 	virtual void begin(struct txn *);
+	/**
+	 * Begine one statement in existing transaction.
+	 */
+	virtual void beginStatement(struct txn *);
 	/**
 	 * Called before a WAL write is made to prepare
 	 * a transaction for commit in the engine.
@@ -118,7 +115,7 @@ public:
 	 * Called to roll back effects of a statement if an
 	 * error happens, e.g., in a trigger.
 	 */
-	virtual void rollbackStatement(struct txn_stmt *);
+	virtual void rollbackStatement(struct txn *, struct txn_stmt *);
 	/*
 	 * Roll back and end the transaction in the engine.
 	 */
@@ -126,23 +123,22 @@ public:
 	/**
 	 * Bootstrap an empty data directory
 	 */
-	virtual void bootstrap() {};
+	virtual void bootstrap();
 	/**
 	 * Begin initial recovery from snapshot or dirty disk data.
 	 */
-	virtual void beginInitialRecovery() {};
+	virtual void beginInitialRecovery(struct vclock *vclock);
 	/**
 	 * Notify engine about a start of recovering from WALs
 	 * that could be local WALs during local recovery
 	 * of WAL catch up durin join on slave side
 	 */
-	virtual void beginFinalRecovery() {};
+	virtual void beginFinalRecovery();
 	/**
 	 * Inform the engine about the end of recovery from the
 	 * binary log.
 	 */
-	virtual void endRecovery() {};
-
+	virtual void endRecovery();
 	/**
 	 * Begin a two-phase snapshot creation in this
 	 * engine (snapshot is a memtx idea of a checkpoint).
@@ -156,12 +152,11 @@ public:
 	 * All engines prepared their checkpoints,
 	 * fix up the changes.
 	 */
-	virtual void commitCheckpoint();
+	virtual void commitCheckpoint(struct vclock *vclock);
 	/**
 	 * An error in one of the engines, abort checkpoint.
 	 */
 	virtual void abortCheckpoint();
-
 public:
 	/** Name of the engine. */
 	const char *name;
@@ -171,11 +166,12 @@ public:
 	uint32_t flags;
 	/** Used for search for engine by name. */
 	struct rlist link;
+	struct tuple_format_vtab *format;
 };
 
 /** Engine handle - an operator of a space */
 
-class Handler {
+struct Handler {
 public:
 	Handler(Engine *f);
 	virtual ~Handler() {}
@@ -183,7 +179,8 @@ public:
 	Handler& operator=(const Handler&) = delete;
 
 	virtual void
-	applySnapshotRow(struct space *space, struct request *);
+	applyInitialJoinRow(struct space *space, struct request *);
+
 	virtual struct tuple *
 	executeReplace(struct txn *, struct space *,
 		       struct request *);
@@ -203,8 +200,31 @@ public:
 		      uint32_t offset, uint32_t limit,
 		      const char *key, const char *key_end,
 		      struct port *);
+	/**
+	 * Create an instance of space index. Used in alter
+	 * space.
+	 */
+	virtual Index *createIndex(struct space *space, struct key_def*) = 0;
+	/**
+	 * Delete all tuples in the index on drop.
+	 */
+	virtual void dropIndex(Index *) = 0;
+	/**
+	 * Notify the engine about the changed space,
+	 * before it's done, to prepare 'new_space'
+	 * object.
+	 */
+	virtual void prepareAlterSpace(struct space *old_space,
+				       struct space *new_space);
 
-	virtual void onAlter(Handler *old);
+	/**
+	 * Notify the engine engine after altering a space and
+	 * replacing old_space with new_space in the space cache,
+	 * to, e.g., update all referenced to struct space
+	 * and replace old_space with new_space.
+	 */
+	virtual void commitAlterSpace(struct space *old_space,
+				      struct space *new_space);
 	Engine *engine;
 };
 
@@ -242,7 +262,7 @@ engine_bootstrap();
  * Called at the start of recovery.
  */
 void
-engine_begin_initial_recovery();
+engine_begin_initial_recovery(struct vclock *vclock);
 
 /**
  * Called in the middle of JOIN stage,

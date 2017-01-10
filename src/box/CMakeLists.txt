@@ -16,7 +16,7 @@ add_custom_target(box_generate_lua_sources
     DEPENDS ${lua_sources})
 set_property(DIRECTORY PROPERTY ADDITIONAL_MAKE_CLEAN_FILES ${lua_sources})
 
-include_directories(${LZ4_INCLUDE_DIRS} ${ZSTD_INCLUDE_DIRS})
+include_directories(${ZSTD_INCLUDE_DIRS})
 
 add_library(box STATIC
     iproto.cc
@@ -30,7 +30,7 @@ add_library(box STATIC
     tuple_format.cc
     tuple.cc
     tuple_convert.cc
-    tuple_update.cc
+    tuple_update.c
     tuple_compare.cc
     key_def.cc
     index.cc
@@ -41,12 +41,15 @@ add_library(box STATIC
     memtx_bitset.cc
     engine.cc
     memtx_engine.cc
+    memtx_space.cc
+    memtx_tuple.cc
     sysview_engine.cc
     sysview_index.cc
     vinyl_engine.cc
     vinyl_space.cc
     vinyl_index.cc
     vinyl.c
+    vy_stmt.c
     space.cc
     func.cc
     alter.cc
@@ -79,7 +82,18 @@ add_library(box STATIC
     lua/error.cc
     lua/session.c
     lua/net_box.c
+    lua/xlog.c
     ${bin_sources})
 
-target_link_libraries(box ${LZ4_LIBRARIES} ${ZSTD_LIBRARIES})
+if (CMAKE_C_COMPILER_VERSION VERSION_EQUAL 4.7.2 AND
+    NOT CMAKE_CROSSCOMPILING AND EXISTS "/etc/debian_version")
+    #
+    # GCC 4.7.2 on Debian Wheezy is buggy and fails to compile
+    # vy_stmt.c with enabled optimizations.
+    #
+    message(WARNING "Detected buggy GCC 4.7.2 on Debian")
+    set_source_files_properties(vy_stmt.c PROPERTIES COMPILE_FLAGS -O0)
+endif()
+
+target_link_libraries(box ${ZSTD_LIBRARIES})
 add_dependencies(box build_bundled_libs)

@@ -48,8 +48,8 @@ struct xstream;
 
 struct recovery {
 	struct vclock vclock;
-	/** The WAL we're currently reading/writing from/to. */
-	struct xlog *current_wal;
+	/** The WAL cursor we're currently reading/writing from/to. */
+	struct xlog_cursor cursor;
 	struct xdir wal_dir;
 	/**
 	 * This is used in local hot standby or replication

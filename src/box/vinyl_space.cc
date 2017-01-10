@@ -28,194 +28,177 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "vinyl_engine.h"
-#include "vinyl_index.h"
 #include "vinyl_space.h"
+#include "vinyl_index.h"
 #include "xrow.h"
 #include "tuple.h"
-#include "scoped_guard.h"
 #include "txn.h"
-#include "index.h"
-#include "space.h"
 #include "schema.h"
-#include "port.h"
 #include "request.h"
 #include "iproto_constants.h"
 #include "vinyl.h"
+#include "vy_stmt.h"
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
 VinylSpace::VinylSpace(Engine *e)
 	:Handler(e)
-{ }
+{}
 
 void
-VinylSpace::applySnapshotRow(struct space *space, struct request *request)
+VinylSpace::applyInitialJoinRow(struct space *space, struct request *request)
 {
 	assert(request->type == IPROTO_INSERT);
 	assert(request->header != NULL);
-	VinylIndex *index = (VinylIndex *)index_find(space, 0);
-	struct vinyl_env *env = index->env;
+	struct vy_env *env = ((VinylEngine *)space->handler->engine)->env;
 
-	/* Check field count in tuple */
-	space_validate_tuple_raw(space, request->tuple);
+	/* Check the tuple fields. */
+	if (tuple_validate_raw(space->format, request->tuple))
+		diag_raise();
 
-	/* Check tuple fields */
-	tuple_validate_raw(space->format, request->tuple);
-
-	struct vinyl_tx *tx = vinyl_begin(env);
+	struct vy_tx *tx = vy_begin(env);
 	if (tx == NULL)
 		diag_raise();
 
 	int64_t signature = request->header->lsn;
 
-	if (vinyl_replace(tx, index->db, request->tuple, request->tuple_end) != 0)
+	if (vy_replace(tx, NULL, space, request))
 		diag_raise();
 
-	int rc = vinyl_prepare(env, tx);
-	switch (rc) {
-	case 0:
-		if (vinyl_commit(env, tx, signature))
-			panic("failed to commit vinyl transaction");
-		return;
-	case 1: /* rollback */
-		vinyl_rollback(env, tx);
-		/* must never happen during JOIN */
-		tnt_raise(ClientError, ER_TRANSACTION_CONFLICT);
-		return;
-	case -1:
-		vinyl_rollback(env, tx);
+	if (vy_prepare(env, tx)) {
+		vy_rollback(env, tx);
 		diag_raise();
-		return;
-	default:
-		unreachable();
 	}
+	if (vy_commit(env, tx, signature))
+		panic("failed to commit vinyl transaction");
 }
 
+/*
+ * Four cases:
+ *  - insert in one index
+ *  - insert in multiple indexes
+ *  - replace in one index
+ *  - replace in multiple indexes.
+ */
 struct tuple *
-VinylSpace::executeReplace(struct txn*,
-			  struct space *space,
-			  struct request *request)
+VinylSpace::executeReplace(struct txn *txn, struct space *space,
+			   struct request *request)
 {
-	VinylIndex *index = (VinylIndex *)index_find(space, 0);
-
-	/* Check field count in tuple */
-	space_validate_tuple_raw(space, request->tuple);
-
-	/* Check tuple fields */
-	tuple_validate_raw(space->format, request->tuple);
-
-	/* unique constraint */
+	assert(request->index_id == 0);
+	struct vy_tx *tx = (struct vy_tx *)txn->engine_tx;
 	VinylEngine *engine = (VinylEngine *)space->handler->engine;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+
 	if (request->type == IPROTO_INSERT && engine->recovery_complete) {
-		uint32_t key_len;
-		const char *key = tuple_extract_key_raw(request->tuple,
-			request->tuple_end, index->key_def, &key_len);
-		mp_decode_array(&key); /* skip array header */
-		struct tuple *found = index->findByKey(key,
-			index->key_def->part_count);
-		if (found) {
-			/*
-			 * tuple is destroyed on the next call to
-			 * box_tuple_XXX() API. See box_tuple_ref()
-			 * comments.
-			 */
-			tnt_raise(ClientError, ER_TUPLE_FOUND,
-					  index_name(index), space_name(space));
-		}
+		if (vy_insert(tx, space, request))
+			diag_raise();
+	} else {
+		if (vy_replace(tx, stmt, space, request))
+			diag_raise();
 	}
 
-	struct tuple *new_tuple = tuple_new(space->format, request->tuple,
-		request->tuple_end);
-	/* GC the new tuple if there is an exception below. */
-	TupleRef ref(new_tuple);
-
-	/* replace */
-	struct vinyl_tx *tx = (struct vinyl_tx *)(in_txn()->engine_tx);
-	int rc = vinyl_replace(tx, index->db, request->tuple,
-			        request->tuple_end);
-	if (rc == -1)
+	stmt->new_tuple = vy_tuple_new(space->format, request->tuple,
+				       request->tuple_end);
+	if (stmt->new_tuple == NULL)
 		diag_raise();
-
-	return tuple_bless(new_tuple);
+	tuple_ref(stmt->new_tuple);
+	return stmt->new_tuple;
 }
 
 struct tuple *
-VinylSpace::executeDelete(struct txn*, struct space *space,
-                           struct request *request)
+VinylSpace::executeDelete(struct txn *txn, struct space *space,
+                          struct request *request)
 {
-	VinylIndex *index = (VinylIndex *)
-		index_find_unique(space, request->index_id);
-	const char *key = request->key;
-	uint32_t part_count = mp_decode_array(&key);
-	primary_key_validate(index->key_def, key, part_count);
-
-	/* remove */
-	struct vinyl_tx *tx = (struct vinyl_tx *)(in_txn()->engine_tx);
-	int rc = vinyl_delete(tx, index->db, key, part_count);
-	if (rc == -1)
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+	struct vy_tx *tx = (struct vy_tx *) txn->engine_tx;
+	if (vy_delete(tx, stmt, space, request))
 		diag_raise();
+	/*
+	 * Delete may or may not set stmt->old_tuple, but we
+	 * always return NULL.
+	 */
 	return NULL;
 }
 
 struct tuple *
-VinylSpace::executeUpdate(struct txn*, struct space *space,
-                           struct request *request)
+VinylSpace::executeUpdate(struct txn *txn, struct space *space,
+                          struct request *request)
 {
-	/* Try to find the tuple by unique key */
-	VinylIndex *index = (VinylIndex *)
-		index_find_unique(space, request->index_id);
-	const char *key = request->key;
-	uint32_t part_count = mp_decode_array(&key);
-	primary_key_validate(index->key_def, key, part_count);
-	struct tuple *old_tuple = index->findByKey(key, part_count);
-
-	if (old_tuple == NULL)
-		return NULL;
-
-	/* Vinyl always yields a zero-ref tuple, GC it here. */
-	TupleRef old_ref(old_tuple);
-
-	/* Do tuple update */
-	struct tuple *new_tuple =
-		tuple_update(space->format,
-		             region_aligned_alloc_xc_cb,
-		             &fiber()->gc,
-		             old_tuple, request->tuple,
-		             request->tuple_end,
-		             request->index_base);
-	TupleRef ref(new_tuple);
-
-	space_validate_tuple(space, new_tuple);
-	space_check_update(space, old_tuple, new_tuple);
-
-	/* replace */
-	struct vinyl_tx *tx = (struct vinyl_tx *)(in_txn()->engine_tx);
-	int rc = vinyl_replace(tx, index->db, new_tuple->data,
-				new_tuple->data + new_tuple->bsize);
-	if (rc == -1)
+	struct vy_tx *tx = (struct vy_tx *)txn->engine_tx;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+	if (vy_update(tx, stmt, space, request) != 0)
 		diag_raise();
-
-	return tuple_bless(new_tuple);
+	return stmt->new_tuple;
 }
 
 void
-VinylSpace::executeUpsert(struct txn*, struct space *space,
+VinylSpace::executeUpsert(struct txn *txn, struct space *space,
                            struct request *request)
 {
-	VinylIndex *index = (VinylIndex *)index_find(space, request->index_id);
+	struct vy_tx *tx = (struct vy_tx *)txn->engine_tx;
+	/* Check update operations. */
+	if (tuple_update_check_ops(region_aligned_alloc_xc_cb, &fiber()->gc,
+				   request->ops, request->ops_end,
+				   request->index_base)) {
+		diag_raise();
+	}
+	if (request->index_base != 0)
+		request_normalize_ops(request);
+	assert(request->index_base == 0);
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+	if (vy_upsert(tx, stmt, space, request) != 0)
+		diag_raise();
+}
 
-	/* Check field count in tuple */
-	space_validate_tuple_raw(space, request->tuple);
+Index *
+VinylSpace::createIndex(struct space *space, struct key_def *key_def)
+{
+	(void) space;
+	VinylEngine *engine = (VinylEngine *) this->engine;
+	if (key_def->type != TREE) {
+		unreachable();
+		return NULL;
+	}
+	return new VinylIndex(engine->env, key_def);
+}
 
-	/* Check tuple fields */
-	tuple_validate_raw(space->format, request->tuple);
-
-	struct vinyl_tx *tx = (struct vinyl_tx *)(in_txn()->engine_tx);
-	int rc = vinyl_upsert(tx, index->db, request->tuple, request->tuple_end,
-			     request->ops, request->ops_end,
-			     request->index_base);
+void
+VinylSpace::dropIndex(Index *index)
+{
+	VinylIndex *i = (VinylIndex *)index;
+	/* schedule asynchronous drop */
+	int rc = vy_index_drop(i->db);
 	if (rc == -1)
 		diag_raise();
+	i->db  = NULL;
+	i->env = NULL;
+}
+
+void
+VinylSpace::prepareAlterSpace(struct space *old_space, struct space *new_space)
+{
+	if (old_space->index_count &&
+	    old_space->index_count <= new_space->index_count) {
+		VinylEngine *engine = (VinylEngine *)old_space->handler->engine;
+		Index *primary_index = index_find_xc(old_space, 0);
+		if (engine->recovery_complete && primary_index->min(NULL, 0)) {
+			/**
+			 * If space is not empty then forbid new indexes creating
+			 */
+			tnt_raise(ClientError, ER_UNSUPPORTED, "Vinyl",
+				  "altering not empty space");
+		}
+	}
+}
+
+void
+VinylSpace::commitAlterSpace(struct space *old_space, struct space *new_space)
+{
+	if (new_space == NULL || new_space->index_count == 0) {
+		/* This is drop space. */
+		return;
+	}
+	vy_commit_alter_space(old_space, new_space);
 }

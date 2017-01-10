@@ -142,12 +142,12 @@ box_tuple_format(const box_tuple_t *tuple);
  * The buffer is valid until next call to box_tuple_* functions.
  *
  * \param tuple a tuple
- * \param field_id zero-based index in MsgPack array.
+ * \param fieldno zero-based index in MsgPack array.
  * \retval NULL if i >= box_tuple_field_count(tuple)
  * \retval msgpack otherwise
  */
 const char *
-box_tuple_field(const box_tuple_t *tuple, uint32_t field_id);
+box_tuple_field(const box_tuple_t *tuple, uint32_t fieldno);
 
 /**
  * Tuple iterator
@@ -217,16 +217,16 @@ box_tuple_rewind(box_tuple_iterator_t *it);
  * Seek the tuple iterator.
  *
  * The returned buffer is valid until next call to box_tuple_* API.
- * Requested field_no returned by next call to box_tuple_next(it).
+ * Requested fieldno returned by next call to box_tuple_next(it).
  *
  * \param it tuple iterator
- * \param field_no field no - zero-based position in MsgPack array.
- * \post box_tuple_position(it) == field_no if returned value is not NULL
+ * \param fieldno - zero-based position in MsgPack array.
+ * \post box_tuple_position(it) == fieldno if returned value is not NULL
  * \post box_tuple_position(it) == box_tuple_field_count(tuple) if returned
  * value is NULL.
  */
 const char *
-box_tuple_seek(box_tuple_iterator_t *it, uint32_t field_no);
+box_tuple_seek(box_tuple_iterator_t *it, uint32_t fieldno);
 
 /**
  * Return the next tuple field from tuple iterator.
@@ -252,41 +252,21 @@ box_tuple_upsert(const box_tuple_t *tuple, const char *expr, const
 
 char *
 box_tuple_extract_key(const box_tuple_t *tuple, uint32_t space_id,
-	uint32_t index_id, uint32_t *key_size);
+		      uint32_t index_id, uint32_t *key_size);
 
 /** \endcond public */
 
 /**
- * @brief Compare two tuple fields using using field type definition
- * @param field_a field
- * @param field_b field
- * @param field_type field type definition
- * @retval 0  if field_a == field_b
- * @retval <0 if field_a < field_b
- * @retval >0 if field_a > field_b
- */
-int
-tuple_compare_field(const char *field_a, const char *field_b,
-		    enum field_type type);
-
-#if defined(__cplusplus)
-} /* extern "C" */
-
-#include "key_def.h" /* for enum field_type */
-#include "tuple_update.h"
-#include "errinj.h"
-
-enum { TUPLE_REF_MAX = UINT16_MAX };
-
-/** Common quota for tuples and indexes */
-extern struct quota memtx_quota;
-/** Tuple allocator */
-extern struct small_alloc memtx_alloc;
-/** Tuple slab arena */
-extern struct slab_arena memtx_arena;
-
-/**
  * An atom of Tarantool storage. Represents MsgPack Array.
+ * Tuple has the following structure:
+ *                           uint32       uint32     bsize
+ *                          +-------------------+-------------+
+ * tuple_begin, ..., raw =  | offN | ... | off1 | MessagePack |
+ * |                        +-------------------+-------------+
+ * |                                            ^
+ * +---------------------------------------data_offset
+ *
+ * Each 'off_i' is the offset to the i-th indexed field.
  */
 struct PACKED tuple
 {
@@ -302,138 +282,174 @@ struct PACKED tuple
 	uint16_t refs;
 	/** format identifier */
 	uint16_t format_id;
-	/** length of the variable part of the tuple */
-	uint32_t bsize;
 	/**
-	 * Fields can have variable length, and thus are packed
-	 * into a contiguous byte array. Each field is prefixed
-	 * with BER-packed field length.
+	 * Length of the MessagePack data in raw part of the
+	 * tuple.
 	 */
-	char data[0];
+	uint32_t bsize;
+	/** Offsets count before MessagePack data. */
+	uint16_t data_offset;
+	/**
+	 * Offsets array concatenated with MessagePack fields
+	 * array.
+	 * char raw[0];
+	 */
 };
 
-/**
- * Create a new tuple from a sequence of MsgPack encoded fields.
- * tuple->refs is 0.
- *
- * Throws an exception if tuple format is incorrect.
- *
- * \sa box_tuple_new()
- */
-struct tuple *
-tuple_new(struct tuple_format *format, const char *data, const char *end);
-
-/**
- * Allocate a tuple
- * It's similar to tuple_new, but does not set tuple data and thus does not
- * initialize field offsets.
- *
- * After tuple_alloc and filling tuple data the tuple_init_field_map must be
- * called!
- *
- * @param size  tuple->bsize
- */
-struct tuple *
-tuple_alloc(struct tuple_format *format, size_t size);
-
-/**
- * Fill field map of tuple by the data in it
- * Used after tuple_alloc call and filling tuple data.
- * Throws an error if tuple data does not match the format.
- */
-void
-tuple_init_field_map(struct tuple_format *format, struct tuple *tuple);
-
-/**
- * Free the tuple.
- * @pre tuple->refs  == 0
- */
-void
-tuple_delete(struct tuple *tuple);
-
-/**
- * Check tuple data correspondence to space format;
- * throw proper exception if smth wrong.
- */
-void
-tuple_validate(struct tuple_format *format, struct tuple *tuple);
-
-/**
- * Check tuple data correspondence to space format;
- * throw proper exception if smth wrong.
- * data argument expected to be a proper msgpack array
- */
-void
-tuple_validate_raw(struct tuple_format *format, const char *data);
-
-/**
- * Throw and exception about tuple reference counter overflow.
- */
-void
-tuple_ref_exception();
-
-/**
- * Increment tuple reference counter.
- * Throws if overflow detected.
- *
- * @pre tuple->refs + count >= 0
- */
-inline void
-tuple_ref(struct tuple *tuple)
+/** Size of the tuple including size of struct tuple. */
+static inline size_t
+tuple_size(const struct tuple *tuple)
 {
-	if (tuple->refs + 1 > TUPLE_REF_MAX)
-		tuple_ref_exception();
-
-	tuple->refs++;
+	/* data_offset includes sizeof(struct tuple). */
+	return tuple->data_offset + tuple->bsize;
 }
 
 /**
- * Decrement tuple reference counter. If it has reached zero, free the tuple.
- *
- * @pre tuple->refs + count >= 0
+ * Get pointer to MessagePack data of the tuple.
+ * @param tuple tuple.
+ * @return MessagePack array.
  */
-inline void
-tuple_unref(struct tuple *tuple)
+inline const char *
+tuple_data(const struct tuple *tuple)
 {
-	assert(tuple->refs - 1 >= 0);
-
-	tuple->refs--;
-
-	if (tuple->refs == 0)
-		tuple_delete(tuple);
+	return (const char *) tuple + tuple->data_offset;
 }
 
-/** Make tuple references exception-friendly in absence of @finally. */
-struct TupleRef {
-	struct tuple *tuple;
-	TupleRef(struct tuple *arg) :tuple(arg) { tuple_ref(tuple); }
-	~TupleRef() { tuple_unref(tuple); }
-	TupleRef(const TupleRef &) = delete;
-	void operator=(const TupleRef&) = delete;
-};
-
-/** Make tuple references exception-friendly in absence of @finally. */
-struct TupleRefNil {
-	struct tuple *tuple;
-	TupleRefNil (struct tuple *arg) :tuple(arg)
-	{ if (tuple) tuple_ref(tuple); }
-	~TupleRefNil() { if (tuple) tuple_unref(tuple); }
-
-	TupleRefNil(const TupleRefNil&) = delete;
-	void operator=(const TupleRefNil&) = delete;
-};
+/**
+ * Get pointer to MessagePack data of the tuple.
+ * @param tuple tuple.
+ * @param[out] size Size in bytes of the MessagePack array.
+ * @return MessagePack array.
+ */
+inline const char *
+tuple_data_range(const struct tuple *tuple, uint32_t *p_size)
+{
+	*p_size = tuple->bsize;
+	return tuple_data(tuple);
+}
 
 /**
-* @brief Return a tuple format instance
-* @param tuple tuple
-* @return tuple format instance
-*/
-static inline struct tuple_format *
+ * @brief Compare two tuple fields using using field type definition
+ * @param field_a field
+ * @param field_b field
+ * @param field_type field type definition
+ * @retval 0  if field_a == field_b
+ * @retval <0 if field_a < field_b
+ * @retval >0 if field_a > field_b
+ */
+int
+tuple_compare_field(const char *field_a, const char *field_b,
+		    enum field_type type);
+
+/**
+ * Extract key from tuple by given key definition and return
+ * buffer allocated on box_txn_alloc with this key.
+ * @param tuple - tuple from which need to extract key
+ * @param key_def - definition of key that need to extract
+ * @param key_size - here will be size of extracted key
+ *
+ * @retval not NULL Success
+ * @retval NULL     Memory allocation error
+ */
+char *
+tuple_extract_key(const struct tuple *tuple, const struct key_def *key_def,
+		  uint32_t *key_size);
+
+/**
+ * Extract key from raw msgpuck by given key definition and return
+ * buffer allocated on box_txn_alloc with this key.
+ * @param data - msgpuck data from which need to extract key
+ * @param data_end - pointer at the end of data
+ * @param key_def - definition of key that need to extract
+ * @param key_size - here will be size of extracted key
+ *
+ * @retval not NULL Success
+ * @retval NULL     Memory allocation error
+ */
+char *
+tuple_extract_key_raw(const char *data, const char *data_end,
+		      const struct key_def *key_def, uint32_t *key_size);
+
+/**
+ * Get the format of the tuple.
+ * @param tuple Tuple.
+ * @retval Tuple format instance.
+ */
+inline struct tuple_format *
 tuple_format(const struct tuple *tuple)
 {
 	struct tuple_format *format = tuple_format_by_id(tuple->format_id);
 	assert(tuple_format_id(format) == tuple->format_id);
 	return format;
+}
+
+/**
+ * Create a new tuple for the engine specified in the tuple format
+ * from a sequence of MessagePack encoded fields.
+ * @param format Tuple format.
+ * @param data   MessagePack array.
+ * @param end    End of the data.
+ *
+ * @retval not NULL Success, tuple with zero refs.
+ * @retval NULL     Memory or format error.
+ *
+ * \sa box_tuple_new()
+ */
+static inline struct tuple *
+tuple_new(struct tuple_format *format, const char *data, const char *end)
+{
+	return format->vtab.create(format, data, end);
+}
+
+/**
+ * Free the tuple of any engine.
+ * @pre tuple->refs  == 0
+ */
+static inline void
+tuple_delete(struct tuple *tuple)
+{
+	say_debug("%s(%p)", __func__, tuple);
+	assert(tuple->refs == 0);
+	struct tuple_format *format = tuple_format(tuple);
+	format->vtab.destroy(format, tuple);
+}
+
+/**
+ * Check tuple data correspondence to space format.
+ * Actually checks everything that checks tuple_init_field_map.
+ * @param format Format to which the tuple must match.
+ * @param tuple  MessagePack array.
+ *
+ * @retval  0 The tuple is valid.
+ * @retval -1 The tuple is invalid.
+ */
+int
+tuple_validate_raw(struct tuple_format *format, const char *data);
+
+/**
+ * Check tuple data correspondence to the space format.
+ * @param format Format to which the tuple must match.
+ * @param tuple  Tuple to validate.
+ *
+ * @retval  0 The tuple is valid.
+ * @retval -1 The tuple is invalid.
+ */
+static inline int
+tuple_validate(struct tuple_format *format, struct tuple *tuple)
+{
+	return tuple_validate_raw(format, tuple_data(tuple));
+}
+
+/*
+ * Return a field map for the tuple.
+ * @param tuple tuple
+ * @returns a field map for the tuple.
+ * @sa tuple_init_field_map()
+ */
+inline const uint32_t *
+tuple_field_map(const struct tuple *tuple)
+{
+	return (const uint32_t *) ((const char *) tuple + tuple->data_offset);
 }
 
 /**
@@ -444,106 +460,24 @@ tuple_format(const struct tuple *tuple)
 inline uint32_t
 tuple_field_count(const struct tuple *tuple)
 {
-	const char *data = tuple->data;
+	const char *data = tuple_data(tuple);
 	return mp_decode_array(&data);
 }
 
 /**
- * Get a field by id from an non-indexed tuple.
- * Returns a pointer to BER-length prefixed field.
- *
- * @returns field data if field exists or NULL
- */
-inline const char *
-tuple_field_raw(const char *data, uint32_t bsize, uint32_t i)
-{
-	const char *pos = data;
-	uint32_t size = mp_decode_array(&pos);
-	if (unlikely(i >= size))
-		return NULL;
-	for (uint32_t k = 0; k < i; k++) {
-		mp_next(&pos);
-	}
-	(void)bsize;
-	assert(pos <= data + bsize);
-	return pos;
-}
-
-/**
- * Get a field from tuple by index.
- * Returns a pointer to BER-length prefixed field.
- *
- * @pre field < tuple->field_count.
- * @returns field data if field exists or NULL
- */
-inline const char *
-tuple_field_old(const struct tuple_format *format,
-		const struct tuple *tuple, uint32_t i)
-{
-	if (likely(i < format->field_count)) {
-		/* Indexed field */
-
-		if (i == 0) {
-			const char *pos = tuple->data;
-			mp_decode_array(&pos);
-			return pos;
-		}
-
-		if (format->fields[i].offset_slot != INT32_MAX) {
-			uint32_t *field_map = (uint32_t *) tuple;
-			int32_t slot = format->fields[i].offset_slot;
-			return tuple->data + field_map[slot];
-		}
-	}
-	ERROR_INJECT(ERRINJ_TUPLE_FIELD, return NULL);
-	return tuple_field_raw(tuple->data, tuple->bsize, i);
-}
-
-/**
- * @brief Return field data of the field
+ * Get a field at the specific index in this tuple.
  * @param tuple tuple
- * @param field_no field number
- * @param field pointer where the start of field data will be stored,
- *        or NULL if field is out of range
+ * @param fieldno the index of field to return
  * @param len pointer where the len of the field will be stored
+ * @retval pointer to MessagePack data
+ * @retval NULL when fieldno is out of range
  */
-static inline const char *
-tuple_field(const struct tuple *tuple, uint32_t i)
+inline const char *
+tuple_field(const struct tuple *tuple, uint32_t fieldno)
 {
-	return tuple_field_old(tuple_format(tuple), tuple, i);
+	return tuple_field_raw(tuple_format(tuple), tuple_data(tuple),
+			       tuple_field_map(tuple), fieldno);
 }
-
-/**
- * A convenience shortcut for data dictionary - get a tuple field
- * as uint32_t.
- */
-inline uint32_t
-tuple_field_u32(struct tuple *tuple, uint32_t i)
-{
-	const char *field = tuple_field(tuple, i);
-	if (field == NULL)
-		tnt_raise(ClientError, ER_NO_SUCH_FIELD, i);
-	if (mp_typeof(*field) != MP_UINT)
-		tnt_raise(ClientError, ER_FIELD_TYPE, i + INDEX_OFFSET,
-			  field_type_strs[NUM]);
-
-	uint64_t val = mp_decode_uint(&field);
-	if (val > UINT32_MAX)
-		tnt_raise(ClientError, ER_FIELD_TYPE, i + INDEX_OFFSET,
-			  field_type_strs[NUM]);
-	return (uint32_t) val;
-}
-
-/**
- * A convenience shortcut for data dictionary - get a tuple field
- * as a NUL-terminated string - returns a string of up to 256 bytes.
- */
-const char *
-tuple_field_cstr(struct tuple *tuple, uint32_t i);
-
-/** Helper method for the above function. */
-const char *
-tuple_field_to_cstr(const char *field, uint32_t len);
 
 /**
  * @brief Tuple Interator
@@ -554,6 +488,8 @@ struct tuple_iterator {
 	struct tuple *tuple;
 	/** Always points to the beginning of the next field. */
 	const char *pos;
+	/** End of the tuple. */
+	const char *end;
 	/** @endcond **/
 	/** field no of the next field. */
 	int fieldno;
@@ -580,9 +516,12 @@ inline void
 tuple_rewind(struct tuple_iterator *it, struct tuple *tuple)
 {
 	it->tuple = tuple;
-	it->pos = tuple->data;
+	uint32_t bsize;
+	const char *data = tuple_data_range(tuple, &bsize);
+	it->pos = data;
 	(void) mp_decode_array(&it->pos); /* Skip array header */
 	it->fieldno = 0;
+	it->end = data + bsize;
 }
 
 /**
@@ -592,7 +531,7 @@ tuple_rewind(struct tuple_iterator *it, struct tuple *tuple)
  * @retval NULL   otherwise (iteration is out of range)
  */
 const char *
-tuple_seek(struct tuple_iterator *it, uint32_t field_no);
+tuple_seek(struct tuple_iterator *it, uint32_t fieldno);
 
 /**
  * @brief Iterate to the next field
@@ -603,6 +542,159 @@ const char *
 tuple_next(struct tuple_iterator *it);
 
 /**
+ * Assert that buffer is valid MessagePack array
+ * @param tuple buffer
+ * @param the end of the buffer
+ */
+static inline void
+mp_tuple_assert(const char *tuple, const char *tuple_end)
+{
+	assert(mp_typeof(*tuple) == MP_ARRAY);
+#ifndef NDEBUG
+	mp_next(&tuple);
+#endif
+	assert(tuple == tuple_end);
+	(void) tuple;
+	(void) tuple_end;
+}
+
+static inline uint32_t
+box_tuple_field_u32(box_tuple_t *tuple, uint32_t fieldno, uint32_t deflt)
+{
+	const char *field = box_tuple_field(tuple, fieldno);
+	if (field != NULL && mp_typeof(*field) == MP_UINT)
+		return mp_decode_uint(&field);
+	return deflt;
+}
+
+#if defined(__cplusplus)
+} /* extern "C" */
+
+#include "tuple_update.h"
+#include "errinj.h"
+
+enum { TUPLE_REF_MAX = UINT16_MAX };
+
+/**
+ * Increment tuple reference counter.
+ * Throws if overflow detected.
+ *
+ * @pre tuple->refs + count >= 0
+ */
+inline void
+tuple_ref(struct tuple *tuple)
+{
+	if (tuple->refs + 1 > TUPLE_REF_MAX)
+		tnt_raise(ClientError, ER_TUPLE_REF_OVERFLOW);
+
+	tuple->refs++;
+}
+
+/**
+ * Decrement tuple reference counter. If it has reached zero, free the tuple.
+ *
+ * @pre tuple->refs + count >= 0
+ */
+inline void
+tuple_unref(struct tuple *tuple)
+{
+	assert(tuple->refs - 1 >= 0);
+
+	tuple->refs--;
+
+	if (tuple->refs == 0)
+		tuple_delete(tuple);
+}
+
+/** Make tuple references exception-friendly in absence of @finally. */
+struct TupleRefNil {
+	struct tuple *tuple;
+	TupleRefNil (struct tuple *arg) :tuple(arg)
+	{ if (tuple) tuple_ref(tuple); }
+	~TupleRefNil() { if (tuple) tuple_unref(tuple); }
+
+	TupleRefNil(const TupleRefNil&) = delete;
+	void operator=(const TupleRefNil&) = delete;
+};
+
+/** Return a tuple field and check its type. */
+inline const char *
+tuple_field_check(const struct tuple *tuple, uint32_t fieldno,
+		  enum mp_type type)
+{
+	const char *field = tuple_field(tuple, fieldno);
+	if (field == NULL)
+		tnt_raise(ClientError, ER_NO_SUCH_FIELD, fieldno);
+	if (mp_typeof(*field) != type)
+		tnt_raise(ClientError, ER_FIELD_TYPE,
+			  fieldno + TUPLE_INDEX_BASE, mp_type_strs[type]);
+	return field;
+}
+
+/**
+ * A convenience shortcut for data dictionary - get a tuple field
+ * as uint64_t.
+ */
+inline uint64_t
+tuple_field_uint(struct tuple *tuple, uint32_t fieldno)
+{
+	const char *field = tuple_field_check(tuple, fieldno, MP_UINT);
+	return mp_decode_uint(&field);
+}
+
+/**
+ * A convenience shortcut for data dictionary - get a tuple field
+ * as uint32_t.
+ */
+inline uint32_t
+tuple_field_u32(struct tuple *tuple, uint32_t fieldno)
+{
+	uint64_t val = tuple_field_uint(tuple, fieldno);
+	if (val > UINT32_MAX) {
+		tnt_raise(ClientError, ER_FIELD_TYPE,
+			  fieldno + TUPLE_INDEX_BASE,
+			  field_type_strs[FIELD_TYPE_UNSIGNED]);
+	}
+	return (uint32_t) val;
+}
+
+/**
+ * A convenience shortcut for data dictionary - get a tuple field
+ * as a NUL-terminated string - returns a string of up to 256 bytes.
+ */
+const char *
+tuple_field_cstr(struct tuple *tuple, uint32_t fieldno);
+
+/** Helper method for the above function. */
+const char *
+tuple_field_to_cstr(const char *field, uint32_t len);
+
+struct tt_uuid;
+/**
+ * Parse a tuple field which is expected to contain a string
+ * representation of UUID, and return a 16-byte representation.
+ */
+void
+tuple_field_uuid(struct tuple *tuple, int fieldno, struct tt_uuid *result);
+
+/** Return a tuple field and check its type. */
+inline const char *
+tuple_next_check(struct tuple_iterator *it, enum mp_type type)
+{
+	uint32_t fieldno = it->fieldno;
+	const char *field = tuple_next(it);
+	if (field == NULL)
+		tnt_raise(ClientError, ER_NO_SUCH_FIELD, it->fieldno);
+	if (mp_typeof(*field) != MP_UINT) {
+		tnt_raise(ClientError, ER_FIELD_TYPE,
+			  fieldno + TUPLE_INDEX_BASE,
+			  mp_type_strs[type]);
+	}
+
+	return field;
+}
+
+/**
  * A convenience shortcut for the data dictionary - get next field
  * from iterator as uint32_t or raise an error if there is
  * no next field.
@@ -611,18 +703,14 @@ inline uint32_t
 tuple_next_u32(struct tuple_iterator *it)
 {
 	uint32_t fieldno = it->fieldno;
-	const char *field = tuple_next(it);
-	if (field == NULL)
-		tnt_raise(ClientError, ER_NO_SUCH_FIELD, it->fieldno);
-	if (mp_typeof(*field) != MP_UINT)
-		tnt_raise(ClientError, ER_FIELD_TYPE, fieldno + INDEX_OFFSET,
-			  field_type_strs[NUM]);
-
+	const char *field = tuple_next_check(it, MP_UINT);
 	uint32_t val = mp_decode_uint(&field);
-	if (val > UINT32_MAX)
-		tnt_raise(ClientError, ER_FIELD_TYPE, fieldno + INDEX_OFFSET,
-			  field_type_strs[NUM]);
-	return (uint32_t) val;
+	if (val > UINT32_MAX) {
+		tnt_raise(ClientError, ER_FIELD_TYPE,
+			  fieldno + TUPLE_INDEX_BASE,
+			  field_type_strs[FIELD_TYPE_UNSIGNED]);
+	}
+	return val;
 }
 
 /**
@@ -633,98 +721,18 @@ tuple_next_u32(struct tuple_iterator *it)
 const char *
 tuple_next_cstr(struct tuple_iterator *it);
 
-/**
- * Extract key from tuple by given key definition and return
- * buffer allocated on box_txn_alloc with this key.
- * @param tuple - tuple from which need to extract key
- * @param key_def - definition of key that need to extract
- * @param key_size - here will be size of extracted key
- */
-char *
-tuple_extract_key(const struct tuple *tuple, struct key_def *key_def,
-		  uint32_t *key_size);
-
-/**
- * Extract key from raw msgpuck by given key definition and return
- * buffer allocated on box_txn_alloc with this key.
- * @param data - msgpuck data from which need to extract key
- * @param data_end - pointer at the end of data
- * @param key_def - definition of key that need to extract
- * @param key_size - here will be size of extracted key
- */
-char *
-tuple_extract_key_raw(const char *data, const char *data_end,
-		      struct key_def *key_def, uint32_t *key_size);
-
 struct tuple *
 tuple_update(struct tuple_format *new_format,
 	     tuple_update_alloc_func f, void *alloc_ctx,
 	     const struct tuple *old_tuple,
-	     const char *expr, const char *expr_end, int field_base);
+	     const char *expr, const char *expr_end, int field_base,
+	     uint64_t *column_mask);
 
 struct tuple *
 tuple_upsert(struct tuple_format *new_format,
 	     void *(*region_alloc)(void *, size_t), void *alloc_ctx,
 	     const struct tuple *old_tuple,
 	     const char *expr, const char *expr_end, int field_base);
-
-
-/**
- * @brief Compare two tuples using field by field using key definition
- * @param tuple_a tuple
- * @param tuple_b tuple
- * @param key_def key definition
- * @retval 0  if key_fields(tuple_a) == key_fields(tuple_b)
- * @retval <0 if key_fields(tuple_a) < key_fields(tuple_b)
- * @retval >0 if key_fields(tuple_a) > key_fields(tuple_b)
- */
-int
-tuple_compare_default(const struct tuple *tuple_a, const struct tuple *tuple_b,
-	      const struct key_def *key_def);
-
-/**
- * @brief Compare two tuples field by field for duplicate using key definition
- * @param tuple_a tuple
- * @param tuple_b tuple
- * @param key_def key definition
- * @retval 0  if key_fields(tuple_a) == key_fields(tuple_b) and
- * tuple_a == tuple_b - tuple_a is the same object as tuple_b
- * @retval <0 if key_fields(tuple_a) <= key_fields(tuple_b)
- * @retval >0 if key_fields(tuple_a > key_fields(tuple_b)
- */
-int
-tuple_compare_dup(const struct tuple *tuple_a, const struct tuple *tuple_b,
-		  const struct key_def *key_def);
-
-/**
- * @brief Compare a tuple with a key field by field using key definition
- * @param tuple_a tuple
- * @param key BER-encoded key
- * @param part_count number of parts in \a key
- * @param key_def key definition
- * @retval 0  if key_fields(tuple_a) == parts(key)
- * @retval <0 if key_fields(tuple_a) < parts(key)
- * @retval >0 if key_fields(tuple_a) > parts(key)
- */
-int
-tuple_compare_with_key_default(const struct tuple *tuple_a, const char *key,
-		       uint32_t part_count, const struct key_def *key_def);
-
-
-inline int
-tuple_compare_with_key(const struct tuple *tuple, const char *key,
-		       uint32_t part_count, const struct key_def *key_def)
-{
-	return key_def->tuple_compare_with_key(tuple, key, part_count, key_def);
-}
-
-inline int
-tuple_compare(const struct tuple *tuple_a, const struct tuple *tuple_b,
-	      const struct key_def *key_def)
-{
-	return key_def->tuple_compare(tuple_a, tuple_b, key_def);
-}
-
 
 /** These functions are implemented in tuple_convert.cc. */
 
@@ -768,7 +776,7 @@ tuple_bless(struct tuple *tuple)
 	assert(tuple != NULL);
 	/* Ensure tuple can be referenced at least once after return */
 	if (tuple->refs + 2 > TUPLE_REF_MAX)
-		tuple_ref_exception();
+		tnt_raise(ClientError, ER_TUPLE_REF_OVERFLOW);
 	tuple->refs++;
 	/* Remove previous tuple */
 	if (likely(box_tuple_last != NULL))
@@ -778,25 +786,13 @@ tuple_bless(struct tuple *tuple)
 	return tuple;
 }
 
-static inline void
-mp_tuple_assert(const char *tuple, const char *tuple_end)
+static inline struct tuple *
+tuple_new_xc(struct tuple_format *format, const char *data, const char *end)
 {
-	assert(mp_typeof(*tuple) == MP_ARRAY);
-#ifndef NDEBUG
-	mp_next(&tuple);
-#endif
-	assert(tuple == tuple_end);
-	(void) tuple;
-	(void) tuple_end;
-}
-
-static inline uint32_t
-box_tuple_field_u32(box_tuple_t *tuple, uint32_t field_no, uint32_t deflt)
-{
-	const char *field = box_tuple_field(tuple, field_no);
-	if (field != NULL && mp_typeof(*field) == MP_UINT)
-		return mp_decode_uint(&field);
-	return deflt;
+	struct tuple *tuple = tuple_new(format, data, end);
+	if (tuple == NULL)
+		diag_raise();
+	return tuple;
 }
 
 #endif /* defined(__cplusplus) */

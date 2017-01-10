@@ -7,12 +7,10 @@ local private = require('box.internal')
 -- see default_cfg below
 local default_vinyl_cfg = {
     memory_limit      = 1.0, -- 1G
-    threads           = 5,
-    compact_wm        = 2,
-    branch_prio       = 2,
-    branch_age        = 0,
-    branch_age_period = 0,
-    branch_age_wm     = 0,
+    threads           = 1,
+    compact_wm        = 2, -- try to maintain less than 2 runs in a range
+    range_size        = 1024 * 1024 * 1024,
+    page_size        = 8 * 1024,
 }
 
 -- all available options
@@ -46,6 +44,7 @@ local default_cfg = {
     username            = nil,
     coredump            = false,
     read_only           = false,
+    hot_standby	        = false,
 
     -- snapshot_daemon
     snapshot_period     = 0,        -- 0 = disabled
@@ -57,10 +56,12 @@ local vinyl_template_cfg = {
     memory_limit      = 'number',
     threads           = 'number',
     compact_wm        = 'number',
-    branch_prio       = 'number',
-    branch_age        = 'number',
-    branch_age_period = 'number',
-    branch_age_wm     = 'number',
+    run_prio          = 'number',
+    run_age           = 'number',
+    run_age_period    = 'number',
+    run_age_wm        = 'number',
+    range_size        = 'number',
+    page_size        = 'number',
 }
 
 -- types of available options
@@ -96,7 +97,8 @@ local template_cfg = {
     coredump            = 'boolean',
     snapshot_period     = 'number',
     snapshot_count      = 'number',
-    read_only           = 'boolean'
+    read_only           = 'boolean',
+    hot_standby         = 'boolean'
 }
 
 local function normalize_uri(port)

@@ -32,16 +32,18 @@
  */
 
 #include <stdbool.h>
-
-#if defined(__cplusplus)
-
-#include "space.h"
-#include "trigger.h"
-#include "fiber.h"
 #include "salad/stailq.h"
 
-extern double too_long_threshold;
+#if defined(__cplusplus)
+extern "C" {
+#endif /* defined(__cplusplus) */
+
+/** box statistics */
+extern struct rmean *rmean_box;
+
+struct space;
 struct tuple;
+struct xrow_header;
 
 /**
  * A single statement of a multi-statement
@@ -56,9 +58,22 @@ struct txn_stmt {
 	struct space *space;
 	struct tuple *old_tuple;
 	struct tuple *new_tuple;
+	/** Engine savepoint for the start of this statement. */
+	void *engine_savepoint;
 	/** Redo info: the binary log row */
 	struct xrow_header *row;
 };
+
+
+#if defined(__cplusplus)
+} /* extern "C" */
+
+#include "space.h"
+#include "trigger.h"
+#include "fiber.h"
+
+extern double too_long_threshold;
+struct tuple;
 
 struct txn {
 	/** List of statements in a transaction. */
@@ -72,8 +87,8 @@ struct txn {
 	bool is_autocommit;
 	/** True if on_commit and on_rollback lists are non-empty. */
 	bool has_triggers;
-	/** A statement-level transaction is active. */
-	bool in_stmt;
+	/** The number of active nested statement-level transactions. */
+	int in_sub_stmt;
 	/** Engine involved in multi-statement transaction. */
 	Engine *engine;
 	/** Engine-specific transaction data */
@@ -149,7 +164,7 @@ struct txn *
 txn_begin_stmt(struct space *space);
 
 void
-txn_begin_in_engine(struct txn *txn, struct space *space);
+txn_begin_in_engine(Engine *engine, struct txn *txn);
 
 /**
  * This is an optimization, which exists to speed up selects
@@ -162,8 +177,10 @@ static inline struct txn *
 txn_begin_ro_stmt(struct space *space)
 {
 	struct txn *txn = in_txn();
-	if (txn)
-		txn_begin_in_engine(txn, space);
+	if (txn) {
+		Engine *engine = space->handler->engine;
+		txn_begin_in_engine(engine, txn);
+	}
 	return txn;
 }
 
@@ -205,7 +222,7 @@ txn_check_autocommit(struct txn *txn, const char *where);
 static inline struct txn_stmt *
 txn_current_stmt(struct txn *txn)
 {
-	return (txn->in_stmt ?
+	return (txn->in_sub_stmt > 0 ?
 		stailq_last_entry(&txn->stmts, struct txn_stmt, next) :
 		NULL);
 }
@@ -256,8 +273,10 @@ box_txn_commit(void);
 
 /**
  * Rollback the current transaction.
+ * May fail if called from a nested
+ * statement.
  */
-API_EXPORT void
+API_EXPORT int
 box_txn_rollback(void);
 
 /**

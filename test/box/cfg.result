@@ -18,6 +18,8 @@ cfg_filter(box.cfg)
     - false
   - - coredump
     - false
+  - - hot_standby
+    - false
   - - listen
     - <hidden>
   - - log_level
@@ -55,20 +57,16 @@ cfg_filter(box.cfg)
   - - too_long_threshold
     - 0.5
   - - vinyl
-    - - - branch_age
-        - 0
-      - - branch_age_period
-        - 0
-      - - branch_age_wm
-        - 0
-      - - branch_prio
-        - 2
-      - - compact_wm
+    - - - compact_wm
         - 2
       - - memory_limit
         - 1
+      - - page_size
+        - 8192
+      - - range_size
+        - 1073741824
       - - threads
-        - 5
+        - 1
   - - vinyl_dir
     - <hidden>
   - - wal_dir
@@ -90,6 +88,8 @@ cfg_filter(box.cfg)
     - false
   - - coredump
     - false
+  - - hot_standby
+    - false
   - - listen
     - <hidden>
   - - log_level
@@ -127,20 +127,16 @@ cfg_filter(box.cfg)
   - - too_long_threshold
     - 0.5
   - - vinyl
-    - - - branch_age
-        - 0
-      - - branch_age_period
-        - 0
-      - - branch_age_wm
-        - 0
-      - - branch_prio
-        - 2
-      - - compact_wm
+    - - - compact_wm
         - 2
       - - memory_limit
         - 1
+      - - page_size
+        - 8192
+      - - range_size
+        - 1073741824
       - - threads
-        - 5
+        - 1
   - - vinyl_dir
     - <hidden>
   - - wal_dir
@@ -202,7 +198,7 @@ box.cfg.slab_alloc_arena, box.cfg.slab_alloc_factor, box.cfg.vinyl.threads
 ---
 - 1
 - 1.1
-- 5
+- 1
 ...
 test_run:cmd("switch default")
 ---
@@ -232,7 +228,7 @@ box.cfg.slab_alloc_arena, box.cfg.slab_alloc_factor, box.cfg.vinyl.threads
 ---
 - 0.2
 - 1.1
-- 5
+- 1
 ...
 test_run:cmd("switch default")
 ---
@@ -292,7 +288,7 @@ box.cfg.slab_alloc_arena, box.cfg.slab_alloc_factor, box.cfg.vinyl.threads
 ---
 - 1
 - 3.14
-- 5
+- 1
 ...
 test_run:cmd("switch default")
 ---

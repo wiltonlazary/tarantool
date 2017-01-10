@@ -10,7 +10,7 @@ if jit.os ~= 'Linux' then PERIOD = 1.5 end
 
 
 space = box.schema.space.create('snapshot_daemon')
-index = space:create_index('pk', { type = 'tree', parts = { 1, 'num' }})
+index = space:create_index('pk', { type = 'tree', parts = { 1, 'unsigned' }})
 
 
 box.cfg{snapshot_period = PERIOD, snapshot_count = 2 }
@@ -73,25 +73,39 @@ daemon.snapshot_count = 20
 -- stop daemon
 box.cfg{ snapshot_count = 0 }
 
--- first start daemon
-box.cfg{ snapshot_count = 2, snapshot_period = 3600}
-period_bias = daemon.snapshot_period_bias
-next_snap_interval = daemon.next_snap_interval(daemon)
-test_snap_interval = 3600 - (fiber.time() + period_bias) % 3600
-(next_snap_interval - test_snap_interval + 3600) % 3600 < 2
+-- Start
+PERIOD = 3600
+box.cfg{ snapshot_count = 2, snapshot_period = PERIOD}
+snapshot_time, time  = daemon.next_snapshot_time, fiber.time()
+snapshot_time + 1 >= time + PERIOD or {snapshot_time, time, PERIOD}
+snapshot_time - 1 <= time + 2 * PERIOD or {snapshot_time, time, PERIOD}
 
-biases = {}
-max_equals = 0
-test_run:cmd("setopt delimiter ';'")
+daemon_fiber = daemon.fiber
+daemon_control = daemon.control
 
-for i = 1, 20 do
-    box.cfg{ snapshot_period = 0}
-    box.cfg{ snapshot_period = 3600}
-    biases[daemon.snapshot_period_bias] = (biases[daemon.snapshot_period_bias] or 0) + 1
-    if biases[daemon.snapshot_period_bias] > max_equals then
-        max_equals = biases[daemon.snapshot_period_bias]
-    end
-end
+-- Reload #1
+PERIOD = 100
+box.cfg{ snapshot_count = 2, snapshot_period = PERIOD}
+snapshot_time, time  = daemon.next_snapshot_time, fiber.time()
+snapshot_time + 1 >= time + PERIOD or {snapshot_time, time, PERIOD}
+snapshot_time - 1 <= time + 2 * PERIOD or {snapshot_time, time, PERIOD}
+daemon.fiber == daemon_fiber
+daemon.control == daemon_control
 
-test_run:cmd("setopt delimiter ''");
-max_equals < 4
+-- Reload #2
+PERIOD = 1000
+box.cfg{ snapshot_count = 2, snapshot_period = PERIOD}
+snapshot_time, time  = daemon.next_snapshot_time, fiber.time()
+snapshot_time + 1 >= time + PERIOD or {snapshot_time, time, PERIOD}
+snapshot_time - 1 <= time + 2 * PERIOD or {snapshot_time, time, PERIOD}
+daemon.fiber == daemon_fiber
+daemon.control == daemon_control
+
+daemon_control = nil
+daemin_fiber = nil
+
+-- Shutdown
+box.cfg{ snapshot_count = 2, snapshot_period = 0}
+daemon.next_snapshot_time
+daemon.fiber == nil
+daemon.control == nil

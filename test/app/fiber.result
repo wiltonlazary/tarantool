@@ -386,13 +386,19 @@ box.snapshot()
 ---
 - ok
 ...
-box.snapshot()
+_, e = pcall(box.snapshot)
 ---
-- error: can't save snapshot, errno 17 (File exists)
 ...
-box.snapshot()
+e.message:match('already exists')
 ---
-- error: can't save snapshot, errno 17 (File exists)
+- already exists
+...
+_, e = pcall(box.snapshot)
+---
+...
+e.message:match('already exists')
+---
+- already exists
 ...
 f = fiber.create(function () fiber.sleep(1) end)
 ---
@@ -514,6 +520,9 @@ f = fiber.create(r)
 fiber.cancel(f)
 ---
 ...
+while f:status() ~= 'dead' do fiber.sleep(0) end
+---
+...
 f:status()
 ---
 - dead
@@ -590,6 +599,9 @@ fib_id = fiber.create(testfun):id()
 ---
 ...
 fiber.find(fib_id):cancel()
+---
+...
+while fiber.find(fib_id) ~= nil do fiber.sleep(0) end
 ---
 ...
 fiber.find(fib_id)
@@ -872,6 +884,9 @@ test_run:grep_log("default", "gh%-1238") ~= nil
 _ = fiber.create(function() fiber.self():cancel() end)
 ---
 ...
+fiber.sleep(0.001)
+---
+...
 test_run:grep_log("default", "FiberIsCancelled") == nil
 ---
 - true
@@ -884,6 +899,22 @@ test_run:grep_log("default", "ER_ILLEGAL_PARAMS:[^\n]*")
 ---
 - 'ER_ILLEGAL_PARAMS: Illegal parameters, oh my'
 ...
+-- #1734 fiber.name irt dead fibers
+fiber.create(function()end):name()
+---
+- error: the fiber is dead
+...
+--
+-- gh-1926
+--
+fiber.create(function() fiber.wakeup(fiber.self()) end)
+---
+- the fiber is dead
+...
 fiber = nil
 ---
+...
+test_run:cmd("clear filter")
+---
+- true
 ...

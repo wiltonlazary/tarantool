@@ -39,6 +39,7 @@
 #include "vclock.h"
 #include "xrow.h"
 #include "coio.h"
+#include "coeio.h"
 #include "cfg.h"
 #include "trigger.h"
 #include "errinj.h"
@@ -79,19 +80,6 @@ relay_set_cord_name(int fd)
 	cord_set_name(name);
 }
 
-int
-relay_initial_join_f(va_list ap)
-{
-	struct relay *relay = va_arg(ap, struct relay *);
-	relay_set_cord_name(relay->io.fd);
-
-	/* Send snapshot */
-	assert(relay->stream.write != NULL);
-	engine_join(&relay->stream);
-
-	return 0;
-}
-
 void
 relay_initial_join(int fd, uint64_t sync)
 {
@@ -101,15 +89,15 @@ relay_initial_join(int fd, uint64_t sync)
 		relay_destroy(&relay);
 	});
 
-	cord_costart(&relay.cord, "initial_join", relay_initial_join_f, &relay);
-	cord_cojoin(&relay.cord);
-	diag_raise();
+	assert(relay.stream.write != NULL);
+	engine_join(&relay.stream);
 }
 
 int
 relay_final_join_f(va_list ap)
 {
 	struct relay *relay = va_arg(ap, struct relay *);
+	coeio_enable();
 	relay_set_cord_name(relay->io.fd);
 
 	/* Send all WALs until stop_vclock */
@@ -136,8 +124,8 @@ relay_final_join(int fd, uint64_t sync, struct vclock *start_vclock,
 	});
 
 	cord_costart(&relay.cord, "final_join", relay_final_join_f, &relay);
-	cord_cojoin(&relay.cord);
-	diag_raise();
+	if (cord_cojoin(&relay.cord) != 0)
+		diag_raise();
 }
 
 static void
@@ -156,7 +144,7 @@ relay_subscribe_f(va_list ap)
 {
 	struct relay *relay = va_arg(ap, struct relay *);
 	struct recovery *r = relay->r;
-
+	coeio_enable();
 	relay->stream.write = relay_send_subscribe_row;
 	relay_set_cord_name(relay->io.fd);
 	recovery_follow_local(r, &relay->stream, fiber_name(fiber()),
@@ -243,8 +231,8 @@ relay_subscribe(int fd, uint64_t sync, struct server *server,
 
 	struct cord cord;
 	cord_costart(&cord, "subscribe", relay_subscribe_f, &relay);
-	cord_cojoin(&cord);
-	diag_raise();
+	if (cord_cojoin(&cord) != 0)
+		diag_raise();
 }
 
 static void
@@ -252,6 +240,7 @@ relay_send(struct relay *relay, struct xrow_header *packet)
 {
 	packet->sync = relay->sync;
 	coio_write_xrow(&relay->io, packet);
+	fiber_gc();
 }
 
 static void

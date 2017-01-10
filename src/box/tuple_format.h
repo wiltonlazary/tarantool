@@ -32,6 +32,7 @@
  */
 
 #include "key_def.h" /* for enum field_type */
+#include "errinj.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -41,12 +42,11 @@ enum { FORMAT_ID_MAX = UINT16_MAX - 1, FORMAT_ID_NIL = UINT16_MAX };
 enum { FORMAT_REF_MAX = INT32_MAX};
 
 /*
- * We don't pass INDEX_OFFSET around dynamically all the time,
+ * We don't pass TUPLE_INDEX_BASE around dynamically all the time,
  * at least hard code it so that in most cases it's a nice error
  * message
  */
-enum { INDEX_OFFSET = 1 };
-
+enum { TUPLE_INDEX_BASE = 1 };
 
 /**
  * @brief Tuple field format
@@ -80,21 +80,51 @@ struct tuple_field_format {
 	int32_t offset_slot;
 };
 
+struct tuple;
+
+/** Engine-specific tuple format methods. */
+struct tuple_format_vtab {
+	/**
+	 * Allocate memory for a new tuple. Reserves memory for
+	 * engine-specific fields, uses engine-specific allocator.
+	 * Initializes the tuple.
+	 */
+	struct tuple *
+	(*create)(struct tuple_format *format, const char *data,
+		     const char *end);
+	/** Free allocated tuple using engine-specific memory allocator. */
+	void
+	(*destroy)(struct tuple_format *format, struct tuple *tuple);
+};
+
+/**
+ * Hack: tuple_format_default and sysview engine use this vtab,
+ * but should use the runtime arena and runtime specific vtab.
+ */
+extern struct tuple_format_vtab memtx_tuple_format_vtab;
+
 /**
  * @brief Tuple format
  * Tuple format describes how tuple is stored and information about its fields
  */
 struct tuple_format {
+	struct tuple_format_vtab vtab;
+
 	uint16_t id;
 	/* Format objects are reference counted. */
 	int refs;
+	/**
+	 * If not set (== 0), any tuple in the space can have any number of
+	 * fields. If set, each tuple must have exactly this number of fields.
+	 */
+	uint32_t exact_field_count;
 	/* Length of 'fields' array. */
 	uint32_t field_count;
 	/**
 	 * Size of field map of tuple in bytes.
 	 * See tuple_field_format::ofset for details//
 	 */
-	uint32_t field_map_size;
+	uint16_t field_map_size;
 
 	/* Formats of the fields */
 	struct tuple_field_format fields[];
@@ -108,14 +138,14 @@ extern struct tuple_format *tuple_format_default;
 
 extern struct tuple_format **tuple_formats;
 
-static inline uint32_t
+inline uint32_t
 tuple_format_id(struct tuple_format *format)
 {
 	assert(tuple_formats[format->id] == format);
 	return format->id;
 }
 
-static inline struct tuple_format *
+inline struct tuple_format *
 tuple_format_by_id(uint32_t tuple_format_id)
 {
 	return tuple_formats[tuple_format_id];
@@ -137,19 +167,77 @@ tuple_format_ref(struct tuple_format *format, int count)
 
 };
 
+/**
+ * Allocate, construct and register a new in-memory tuple format.
+ * @param key_list List of key_defs of a space.
+ * @param name  name of the tuple format
+ *
+ * @retval not NULL Tuple format.
+ * @retval     NULL Memory error.
+ */
+struct tuple_format *
+tuple_format_new(struct rlist *key_list, struct tuple_format_vtab *vtab);
+
+/**
+ * Fill the field map of tuple with field offsets.
+ * @param format    Tuple format.
+ * @param field_map A pointer behind the last element of the field
+ *                  map.
+ * @param tuple     MessagePack array.
+ *
+ * @retval  0 Success.
+ * @retval -1 Format error.
+ *            +-------------------+
+ * Result:    | offN | ... | off1 |
+ *            +-------------------+
+ *                                ^
+ *                             field_map
+ * tuple + off_i = indexed_field_i;
+ */
+int
+tuple_init_field_map(const struct tuple_format *format, uint32_t *field_map,
+		     const char *tuple);
+
+/**
+ * Get a field at the specific position in this MessagePack array.
+ * Returns a pointer to MessagePack data.
+ * @param format tuple format
+ * @param tuple a pointer to MessagePack array
+ * @param field_map a pointer to the LAST element of field map
+ * @param field_no the index of field to return
+ *
+ * @returns field data if field exists or NULL
+ * @sa tuple_init_field_map()
+ */
+inline const char *
+tuple_field_raw(const struct tuple_format *format, const char *tuple,
+		const uint32_t *field_map, uint32_t field_no)
+{
+	if (likely(field_no < format->field_count)) {
+		/* Indexed field */
+
+		if (field_no == 0) {
+			mp_decode_array(&tuple);
+			return tuple;
+		}
+
+		if (format->fields[field_no].offset_slot != INT32_MAX) {
+			int32_t slot = format->fields[field_no].offset_slot;
+			return tuple + field_map[slot];
+		}
+	}
+	ERROR_INJECT(ERRINJ_TUPLE_FIELD, return NULL);
+	uint32_t field_count = mp_decode_array(&tuple);
+	if (unlikely(field_no >= field_count))
+		return NULL;
+	for (uint32_t k = 0; k < field_no; k++)
+		mp_next(&tuple);
+	return tuple;
+}
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */
-
-/**
- * @brief Allocate, construct and register a new in-memory tuple
- *	 format.
- * @param space description
- *
- * @return tuple format or raise an exception on error
- */
-struct tuple_format *
-tuple_format_new(struct rlist *key_list);
 
 void
 tuple_format_init();
